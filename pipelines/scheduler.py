@@ -102,7 +102,8 @@ def refresh_candles():
 
 
 def scheduled_report(kind: str):
-    touch(f"last_{kind}_date")
+    # ВАЖНО: пишем ДАТУ (YYYY-MM-DD), а не полный datetime — по ней проверяется повтор
+    db.set_meta(f"last_{kind}_date", now_local().strftime("%Y-%m-%d"))
     fetch_quotes.fetch_snapshot()
     refresh_candles()
     signals = analyze.run_analysis(kind)
@@ -112,6 +113,33 @@ def scheduled_report(kind: str):
         if q:
             deliver.send_text(q)
     log.info("отчёт %s отправлен (%d сигналов)", kind, len(signals))
+
+
+def intraday_scan():
+    """Скан пула внимания на 10-минутках: скачки, объёмы, пробои (смарт-мани)."""
+    from . import intraday
+    for secid in db.get_pool():
+        try:
+            events = intraday.scan(secid)
+        except Exception as e:
+            log.warning("scan %s: %s", secid, e)
+            continue
+        for ev in events:
+            ind = ev["ind"]
+            head = (f"{ev['title']} — <b>{secid}</b>\n"
+                    f"Цена <b>{ind['last']:.4g} ₽</b> · за день {ind['chg_day']:+.2f}% · "
+                    f"объём x{ev['vol']}\n"
+                    f"VWAP {ind['vwap'] and format(ind['vwap'], '.4g')} ₽ · "
+                    f"RSI(10м) {ind['rsi14']} · "
+                    f"{ind['range_pos']}% диапазона дня ({ind['day_low']:.4g}—{ind['day_high']:.4g})\n"
+                    f"💡 {ev['idea']}\n"
+                    f"<i>Разбор картины, не рекомендация.</i>")
+            try:
+                deliver.send_text(head)
+                log.info("интрадей-алерт %s %s", secid, ev["type"])
+            except Exception as e:
+                log.warning("alert send: %s", e)
+
 
 
 def healthcheck_ping(ok: bool = True):
@@ -140,6 +168,12 @@ def run_cycle():
     if is_session(now) and minutes_since("last_quotes") >= cfg["quotes_interval_min"]:
         touch("last_quotes")
         fetch_quotes.fetch_snapshot()
+        ran = True
+
+    # --- интрадей-сканер пула внимания (в торговые часы) ---
+    if is_session(now) and minutes_since("last_scan") >= cfg.get("scan_interval_min", 5):
+        touch("last_scan")
+        intraday_scan()
         ran = True
 
     # --- брифинг (время в зоне владельца) ---

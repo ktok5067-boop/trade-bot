@@ -46,16 +46,16 @@ def _news_block(news: list[dict], ticker: str, max_n: int) -> str:
     return "\n".join(lines) if lines else "- релевантных новостей нет"
 
 
-def _tech_block() -> list[str]:
-    """Строки техкартины по всем тикерам watchlist."""
+def _tech_block(pool: list[str]) -> list[str]:
+    """Строки техкартины по пулу внимания."""
     lines = []
-    for w in fetch_quotes.watchlist():
-        candles = db.get_candles(w["ticker"])
+    for t in pool:
+        candles = db.get_candles(t)
         try:
             ind = indicators.compute(candles)
         except Exception:
             ind = None
-        lines.append(indicators.to_prompt_line(w["ticker"], ind))
+        lines.append(indicators.to_prompt_line(t, ind))
     return lines
 
 
@@ -86,17 +86,18 @@ def _performance_line() -> str:
 
 
 def build_user_prompt(news: list[dict], prices: dict, idx: dict) -> str:
+    pool = db.get_pool()
+    names = {w["ticker"]: w.get("name", t) for w in fetch_quotes.watchlist()}
     parts = [f"Дата анализа (МСК): {db.now_iso()}",
              f"Индекс IMOEX: {idx.get('value', 'n/a')} ({idx.get('chg_pct', 'n/a')}%)",
              _performance_line(),
              "", "== ТЕХНИЧЕСКАЯ КАРТИНА =="]
-    parts += _tech_block()
+    parts += _tech_block(pool)
     parts += ["", "== НОВОСТИ И КОНТЕКСТ =="]
-    for w in fetch_quotes.watchlist():
-        t = w["ticker"]
+    for t in pool:
         p = prices.get(t, {})
         price_line = f"цена сейчас: {p.get('last', 'n/a')} ₽ (за день {p.get('chg_pct', 'n/a')}%)"
-        parts.append(f"### {t} ({w.get('name', t)})\nКотировки: {price_line}")
+        parts.append(f"### {t} ({names.get(t, t)})\nКотировки: {price_line}")
         parts.append(_news_block(news, t, CONFIG["llm"]["max_news_per_ticker"]))
         parts.append("")
     return "\n".join(parts)
@@ -129,10 +130,9 @@ def _validate(signals: list, allowed: set[str]) -> list[dict]:
 
 
 def _fallback_signals(prices: dict) -> list[dict]:
-    """Если LLM недоступен — сигналы чисто по теханализу (правдоподобнее, чем flat)."""
+    """Если LLM недоступен — сигналы чисто по теханализу пула."""
     out = []
-    for w in fetch_quotes.watchlist():
-        t = w["ticker"]
+    for t in db.get_pool():
         candles = db.get_candles(t)
         try:
             ind = indicators.compute(candles)
@@ -164,11 +164,14 @@ def _fallback_signals(prices: dict) -> list[dict]:
 
 
 def run_analysis(kind: str) -> list[dict]:
-    """Собрать контекст, вызвать LLM, провалидировать, сохранить сигналы."""
+    """Собрать контекст, вызвать LLM, провалидировать, сохранить сигналы.
+
+    Анализ — по ПУЛУ ВНИМАНИЯ (db.get_pool), не по всему watchlist.
+    """
     prices = db.latest_prices() or {}
     idx = fetch_quotes.fetch_index()
     news = db.recent_news(hours=CONFIG["llm"]["news_hours"])
-    allowed = {w["ticker"] for w in fetch_quotes.watchlist()}
+    allowed = set(db.get_pool())
 
     signals: list[dict] = []
     try:

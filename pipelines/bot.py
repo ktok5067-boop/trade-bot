@@ -15,12 +15,14 @@ log = logging.getLogger("bot")
 
 API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 HELP = """Команды:
-/help — эта справка
-/status — состояние: токены, новости, сигналы
-/watchlist — тикеры для анализа
-/quote SBER — текущая котировка (можно и по-русски: /quote спб биржа)
+/pool — пул внимания (за чем следит интрадей-сканер)
+/pool add SBER — добавить бумагу в пул
+/pool del SBER — убрать из пула
+/quote SBER — котировка (можно по-русски: /quote спб биржа)
+/idea SPBE — торговая идея по интрадею (VWAP, смарт-мани, вход/выход)
 /signals — последние сигналы
 /brief — запустить анализ сейчас
+/status — состояние бота
 Голосовое сообщение или просто текст — задайте вопрос."""
 
 
@@ -250,6 +252,85 @@ def handle_update(msg: dict):
                     deliver.send_text(f"{t}: котировок нет. Посмотрите /watchlist", chat_id)
         else:
             deliver.send_text(f"«{arg}» нет в watchlist. Посмотрите /watchlist", chat_id)
+
+    elif text.startswith("/pool"):
+        parts = text.split(maxsplit=2)
+        sub = (parts[1].lower() if len(parts) > 1 else "")
+        if sub in ("add", "del", "remove"):
+            arg = (parts[2] if len(parts) > 2 else "").upper().strip()
+            if not arg:
+                deliver.send_text("Укажите тикер: /pool add SBER", chat_id)
+                return
+            pool = db.get_pool()
+            if sub == "add":
+                if arg in pool:
+                    deliver.send_text(f"{arg} уже в пуле.", chat_id)
+                    return
+                pool.append(arg)
+                db.set_pool(pool)
+                deliver.send_text(f"✅ {arg} добавлен в пул: {', '.join(pool)}", chat_id)
+            else:
+                if arg not in pool:
+                    deliver.send_text(f"{arg} нет в пуле.", chat_id)
+                    return
+                if len(pool) == 1:
+                    deliver.send_text("Пул не может быть пустым — оставьте хотя бы одну бумагу.", chat_id)
+                    return
+                pool.remove(arg)
+                db.set_pool(pool)
+                deliver.send_text(f"➖ {arg} убран. Пул: {', '.join(pool)}", chat_id)
+        else:
+            pool = db.get_pool()
+            deliver.send_text(
+                "🎯 Пул внимания (интрадей-сканер следит за этими бумагами):\n"
+                + "\n".join(f"• {t}" for t in pool)
+                + "\n\nДобавить: /pool add SBER · убрать: /pool del SBER", chat_id)
+
+    elif text.startswith("/idea"):
+        parts = text.split(maxsplit=1)
+        arg = (parts[1] if len(parts) > 1 else "").strip()
+        pool = db.get_pool()
+        t = arg.upper() if arg.upper() in pool else ""
+        if not t and arg:
+            resolved = resolve_tickers(arg)
+            t = resolved[0] if resolved else ""
+        if not t:
+            t = pool[0] if pool else "SPBE"
+        deliver.send_text(f"Считаю интрадей-картину {t}…", chat_id)
+        try:
+            from . import indicators, intraday
+            bars = intraday.fetch_bars(t)
+            ind = intraday.analyze_bars(bars)
+            if not ind:
+                deliver.send_text(f"{t}: интрадей-данных недостаточно (биржа закрыта?).", chat_id)
+                return
+            daily_ind = None
+            try:
+                daily_ind = indicators.compute(db.get_candles(t))
+            except Exception:
+                pass
+            daily_line = indicators.to_prompt_line(t, daily_ind) if daily_ind else f"{t}: дневных данных нет"
+            events = intraday.detect_events(t, ind)
+            ev_lines = "\n".join(
+                f"• {intraday.RUS.get(e['type'], e['type'])} (движение {e['move']:+.2f}%, объём x{e['vol']})"
+                for e in events) or "• активных событий нет — рынок спокоен"
+            sys = ("Ты — трейдер-споттер на Мосбирже, зарабатываешь на внутридневной волатильности. "
+                   "По данным интрадей-свечей (10м) и дневному теханализу дай план: зона входа, "
+                   "цель, стоп, что делать при пробое. Кратко (до 120 слов), по-русски, "
+                   "учитывай VWAP, объёмные импульсы (смарт-мани) и положение в диапазоне дня. "
+                   "Если данные противоречивы — скажи 'сидим на заборе'.")
+            user = (f"{intraday.summary_line(t, ind)}\n"
+                    f"VWAP {ind['vwap']}, SMA5 {ind['sma5']}, SMA20 {ind['sma20']}\n"
+                    f"События сейчас:\n{ev_lines}\n\nДневная картина: {daily_line}")
+            answer = llm.chat([{"role": "system", "content": sys},
+                               {"role": "user", "content": user}],
+                              max_tokens=500, temperature=0.3)
+            deliver.send_text(f"🎯 <b>{t} — интрадей-план</b>\n"
+                              f"{intraday.summary_line(t, ind)}\n\n{answer}", chat_id)
+        except Exception as e:
+            log.exception("idea failed")
+            deliver.send_text(f"Ошибка идеи: {e}", chat_id)
+
     elif text.startswith("/signals"):
         rows = db.signals_since(hours=24)
         sigs = [s for row in rows if row["kind"] in ("brief", "evening") for s in row["payload"]]

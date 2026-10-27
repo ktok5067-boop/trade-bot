@@ -30,6 +30,36 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def minutes_since_meta(key: str, default: float = 1e9) -> float:
+    """Минуты с момента, записанного в meta (now_iso). Иначе default."""
+    v = get_meta(key)
+    if not v:
+        return default
+    try:
+        dt = datetime.fromisoformat(v)
+    except ValueError:
+        return default
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).total_seconds() / 60
+
+
+def get_pool() -> list[str]:
+    """Пул внимания для интрадей-сканера (по умолчанию SPBE)."""
+    raw = get_meta("focus_pool")
+    if not raw:
+        return ["SPBE"]
+    try:
+        pool = json.loads(raw)
+        return pool if isinstance(pool, list) and pool else ["SPBE"]
+    except (ValueError, TypeError):
+        return ["SPBE"]
+
+
+def set_pool(pool: list[str]):
+    set_meta("focus_pool", json.dumps(pool))
+
+
 def init_db():
     with conn() as c:
         c.executescript("""
