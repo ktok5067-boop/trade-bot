@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: trade-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m pipelines.scheduler
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: DEEPSEEK_BASE_URL
+        value: https://taynik.store/api/ai/v1
+      - key: DEEPSEEK_MODEL
+        value: glm/glm-5.3-flash
+      - key: TELEGRAM_ALLOWED_IDS
+        sync: false
+      - key: TELEGRAM_REPORT_CHAT_ID
+        sync: false

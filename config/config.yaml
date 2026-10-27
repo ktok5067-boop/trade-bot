@@ -1,0 +1,119 @@
+# ============================================================
+# Конфигурация торгового агента
+# Секреты (токены, ключи) — НЕ здесь, а в .env / HF Secrets
+# ============================================================
+
+# Дисклеймер «не ИИР» в отчётах (для личного использования отключён)
+show_disclaimer: false
+
+# Watchlist: тикеры Мосбиржи + ключевые слова для поиска новостей по эмитенту
+watchlist:
+  - ticker: SBER
+    name: Сбербанк
+    keywords: ["сбербанк", "сбер", "греф"]
+  - ticker: SPBE
+    name: СПБ Биржа
+    keywords: ["спб биржа", "spb exchange"]
+  - ticker: GAZP
+    name: Газпром
+    keywords: ["газпром", "миллер"]
+  - ticker: LKOH
+    name: Лукойл
+    keywords: ["лукойл", "алекперов"]
+  - ticker: ROSN
+    name: Роснефть
+    keywords: ["роснефть", "сечин"]
+  - ticker: GMKN
+    name: Норникель
+    keywords: ["норникель", "норильский никель", "потанин"]
+  - ticker: YDEX
+    name: Яндекс
+    keywords: ["яндекс"]
+  - ticker: T
+    name: Т-Технологии
+    keywords: ["тинькофф", "т-технологи", "т-банк"]
+  - ticker: MGNT
+    name: Магнит
+    keywords: ["магнит", "утаев"]
+  - ticker: VTBR
+    name: ВТБ
+    keywords: ["втб", "костьин"]
+  - ticker: MTSS
+    name: МТС
+    keywords: ["мтс"]
+  - ticker: AFLT
+    name: Аэрофлот
+    keywords: ["аэрофлот"]
+  - ticker: CHMF
+    name: Северсталь
+    keywords: ["северсталь", "мордашов"]
+  - ticker: PLZL
+    name: Полюс
+    keywords: ["полюс"]
+  - ticker: PHOR
+    name: Фосагро
+    keywords: ["фосагро"]
+  - ticker: SNGS
+    name: Сургутнефтегаз
+    keywords: ["сургутнефтегаз"]
+  - ticker: TATN
+    name: Татнефть
+    keywords: ["татнефть"]
+  - ticker: NVTK
+    name: Новатэк
+    keywords: ["новатэк", "михельсон"]
+  - ticker: MOEX
+    name: Мосбиржа
+    keywords: ["мосбирж", "московская биржа"]
+  - ticker: RUAL
+    name: РУСАЛ
+    keywords: ["русал"]
+  - ticker: IRAO
+    name: Интер РАО
+    keywords: ["интер рао"]
+  - ticker: TRNFP
+    name: Транснефть-ап
+    keywords: ["транснефть"]
+
+# RSS-ленты (базовый бесплатный поток новостей)
+feeds:
+  - name: Interfax
+    url: "https://www.interfax.ru/rss.asp"
+  - name: RBC
+    url: "https://rsstor.rbc.ru/rbc/news"
+  - name: Prime
+    url: "https://1prime.ru/rss"
+  - name: Vedomosti
+    url: "https://www.vedomosti.ru/rss/news"
+  - name: Kommersant
+    url: "https://www.kommersant.ru/RSS/news.xml"
+
+# Exa — семантический поиск новостей (если EXA_API_KEY задан в .env).
+exa_queries:
+  - "российский фондовый рынок новости"
+  - "санкции против России новости"
+  - "нефть газ цены новости"
+
+# Расписания. Время брифингов — в зоне владельца (tz), торговое окно — по МСК.
+schedule:
+  tz: "Asia/Vladivostok"       # зона владельца (Владивосток, UTC+10)
+  tz_label: "ВЛТ"
+  quotes_interval_min: 10      # опрос котировок MOEX ISS
+  news_interval_min: 20        # опрос RSS + Exa
+  brief_time: "09:00"          # утренний брифинг (= 02:00 МСК, до открытия MOEX)
+  evening_time: "22:00"        # итоги дня (= 15:00 МСК, к концу сессии)
+  session_start: "09:50"       # торговое окно MOEX, по МСК
+  session_end: "19:00"
+
+# Правила алертов
+alerts:
+  impact_threshold: 3          # слать алерт при важности >= 3 (важные события)
+  max_per_hour: 5              # антиспам: максимум алертов в час
+  llm_comment: false           # true = короткий LLM-комментарий к алерту (тратит токены)
+
+# LLM
+llm:
+  max_tokens: 4500
+  temperature: 0.2
+  news_hours: 48               # глубина новостей для анализа
+  max_news_per_ticker: 6       # сколько новостей на тикер в промпт
