@@ -15,12 +15,21 @@ DB_PATH = DATA_DIR / "bot.db"
 
 @contextmanager
 def conn():
+    """Соединение с БД + ретрай на 'database is locked' (3×0.5с)."""
+    import time
     c = sqlite3.connect(DB_PATH, timeout=30)
     c.row_factory = sqlite3.Row
     try:
         c.execute("PRAGMA journal_mode=WAL")
         yield c
-        c.commit()
+        for attempt in range(3):
+            try:
+                c.commit()
+                break
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e).lower() or attempt == 2:
+                    raise
+                time.sleep(0.5)
     finally:
         c.close()
 

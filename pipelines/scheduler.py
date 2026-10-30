@@ -49,7 +49,7 @@ def is_session(now_local_dt: datetime) -> bool:
     msk = now_local_dt.astimezone(MSK_TZ)
     start = datetime.strptime(cfg["session_start"], "%H:%M").time()
     end = datetime.strptime(cfg["session_end"], "%H:%M").time()
-    return msk.weekday() < 6 and start <= msk.time() <= end
+    return msk.weekday() < 5 and start <= msk.time() <= end
 
 
 def _parse_hhmm(s: str):
@@ -115,30 +115,107 @@ def scheduled_report(kind: str):
     log.info("отчёт %s отправлен (%d сигналов)", kind, len(signals))
 
 
+def _intraday_alerts_count_key() -> str:
+    """Ключ meta для счётчика алертов за сегодня (зона владельца)."""
+    return f"intraday_alerts_{now_local().strftime('%Y-%m-%d')}"
+
+
+def intraday_alerts_today() -> int:
+    raw = db.get_meta(_intraday_alerts_count_key())
+    try:
+        return int(raw) if raw else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bump_intraday_alert():
+    db.set_meta(_intraday_alerts_count_key(), str(intraday_alerts_today() + 1))
+
+
 def intraday_scan():
-    """Скан пула внимания на 10-минутках: скачки, объёмы, пробои (смарт-мани)."""
+    """Скан пула внимания на 10-минутках: скачки, объёмы, пробои (смарт-мани).
+
+    Антиспам: ТОП-1 событие на бумагу за скан; дневной лимит max_per_day на весь
+    пул (claim-then-send: cooldown-метку ставим только после успешной отправки).
+    """
     from . import intraday
+    max_per_day = int(CONFIG["intraday"].get("max_per_day", 12))
     for secid in db.get_pool():
         try:
             events = intraday.scan(secid)
         except Exception as e:
             log.warning("scan %s: %s", secid, e)
             continue
-        for ev in events:
-            ind = ev["ind"]
-            head = (f"{ev['title']} — <b>{secid}</b>\n"
-                    f"Цена <b>{ind['last']:.4g} ₽</b> · за день {ind['chg_day']:+.2f}% · "
-                    f"объём x{ev['vol']}\n"
-                    f"VWAP {ind['vwap'] and format(ind['vwap'], '.4g')} ₽ · "
-                    f"RSI(10м) {ind['rsi14']} · "
-                    f"{ind['range_pos']}% диапазона дня ({ind['day_low']:.4g}—{ind['day_high']:.4g})\n"
-                    f"💡 {ev['idea']}\n"
-                    f"<i>Разбор картины, не рекомендация.</i>")
-            try:
-                deliver.send_text(head)
-                log.info("интрадей-алерт %s %s", secid, ev["type"])
-            except Exception as e:
-                log.warning("alert send: %s", e)
+        if not events:
+            continue
+        # ТОП-1 событие на бумагу (events уже отсортированы по power в scan)
+        ev = events[0]
+        ind = ev["ind"]
+        head = (f"{ev['title']} — <b>{secid}</b>\n"
+                f"Цена <b>{ind['last']:.4g} ₽</b> · за день {ind['chg_day']:+.2f}% · "
+                f"объём x{ev['ev']['vol']}\n"
+                f"VWAP {ind['vwap'] and format(ind['vwap'], '.4g')} ₽ · "
+                f"RSI(10м) {ind['rsi14']} · "
+                f"{ind['range_pos']}% диапазона дня ({ind['day_low']:.4g}—{ind['day_high']:.4g})\n"
+                f"💡 {ev['idea']}\n"
+                f"<i>Разбор картины, не рекомендация.</i>")
+        if intraday_alerts_today() >= max_per_day:
+            log.info("интрадей-лимит %d алертов/день достигнут — %s пропущен",
+                     max_per_day, secid)
+            continue
+        # claim-then-send: метку ставим только после успешной отправки
+        try:
+            deliver.send_text(head)
+        except Exception as e:
+            log.warning("alert send %s: %s", secid, e)
+            continue
+        # успешно отправили — фиксируем cooldown и счётчик
+        db.set_meta(intraday._cooldown_key(secid, ev["ev"]["type"]), db.now_iso())
+        _bump_intraday_alert()
+        log.info("интрадей-алерт %s %s", secid, ev["ev"]["type"])
+
+
+def _intraday_summary_sent_today() -> bool:
+    return db.get_meta("last_intraday_summary_date") == now_local().strftime("%Y-%m-%d")
+
+
+def intraday_summary():
+    """Итоги интрадея: после закрытия сессии, один раз в день.
+
+    По каждой бумаге пула: close vs VWAP, изменение за день, число алертов.
+    """
+    from . import intraday
+    # были ли алерты сегодня и сканировали ли сегодня
+    if intraday_alerts_today() == 0:
+        return
+    lines = ["🌙 <b>Итоги интрадея</b>"]
+    for secid in db.get_pool():
+        try:
+            bars = intraday.fetch_bars(secid)
+            ind = intraday.analyze_bars(bars)
+        except Exception as e:
+            log.warning("summary %s: %s", secid, e)
+            continue
+        if not ind:
+            lines.append(f"• <b>{secid}</b>: данных нет")
+            continue
+        close = ind["last"]
+        vwap = ind["vwap"]
+        chg = ind["chg_day"]
+        rel = ""
+        if vwap:
+            rel = "выше VWAP" if close > vwap else ("ниже VWAP" if close < vwap else "у VWAP")
+            rel = f" · {rel} ({vwap:.4g}₽)"
+        lines.append(f"• <b>{secid}</b>: {close:.4g}₽ ({chg:+.2f}% за день){rel}")
+    lines.append(f"\nАлертов за день: {intraday_alerts_today()}")
+    text = "\n".join(lines)
+    try:
+        deliver.send_text(text)
+    except Exception as e:
+        log.warning("summary send: %s", e)
+        return
+    db.set_meta("last_intraday_summary_date", now_local().strftime("%Y-%m-%d"))
+    log.info("интрадей-сводка отправлена (%d алертов)", intraday_alerts_today())
 
 
 
@@ -174,6 +251,13 @@ def run_cycle():
     if is_session(now) and minutes_since("last_scan") >= cfg.get("scan_interval_min", 5):
         touch("last_scan")
         intraday_scan()
+        ran = True
+
+    # --- итоги интрадея: первый цикл после закрытия сессии (один раз в день) ---
+    if (not is_session(now)
+            and db.get_meta("last_scan")[:10] == now.strftime("%Y-%m-%d")
+            and not _intraday_summary_sent_today()):
+        intraday_summary()
         ran = True
 
     # --- брифинг (время в зоне владельца) ---

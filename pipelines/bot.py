@@ -347,8 +347,11 @@ def handle_update(msg: dict):
                 cur += ("\n" if cur else "") + b
             if cur:
                 msgs.append(cur)
-            msgs[-1] = msgs[-1] + deliver.DISCLAIMER if len(msgs[-1]) + len(deliver.DISCLAIMER) <= deliver.TG_LIMIT \
-                else msgs[-1]
+            # дисклеймер всегда в последнем чанке: если не влезает — отдельным сообщением
+            if len(msgs[-1]) + len(deliver.DISCLAIMER) <= deliver.TG_LIMIT:
+                msgs[-1] = msgs[-1] + deliver.DISCLAIMER
+            else:
+                msgs.append(deliver.DISCLAIMER.lstrip("\n"))
             if len(msgs) > 1:
                 deliver.send_text(f"Сигналов за 24ч много — шлю в {len(msgs)} частях", chat_id)
             for m in msgs:

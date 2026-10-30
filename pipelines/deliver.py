@@ -6,6 +6,8 @@ import logging
 import zoneinfo
 from datetime import datetime
 
+import requests
+
 from .http import session as requests_session
 from . import db, llm
 from .settings import LOCAL_TZ, MSK, REPORT_CHAT_ID, SHOW_DISCLAIMER, TELEGRAM_BOT_TOKEN, TZ_LABEL
@@ -25,11 +27,47 @@ KIND_TITLE = {"brief": "🌅 Утренний брифинг", "evening": "🌙 
 
 
 def tg(method: str, **params) -> dict:
-    r = requests_session.post(f"{API}/{method}", json=params, timeout=30)
-    d = r.json()
-    if not d.get("ok"):
-        raise RuntimeError(f"Telegram {method}: {d.get('description')}")
-    return d
+    """POST к Telegram с ретраями на сетевые ошибки / 429 / 5xx.
+
+    До 3 ретраев с паузами 2/5/10 сек. 429 уважает retry_after от Telegram.
+    """
+    import time
+    delays = (2, 5, 10)
+    last_err = None
+    for attempt in range(1 + len(delays)):
+        try:
+            r = requests_session.post(f"{API}/{method}", json=params, timeout=30)
+        except (requests.RequestException, OSError) as e:
+            last_err = e
+        else:
+            if r.status_code == 429:
+                retry_after = None
+                try:
+                    retry_after = int(r.json().get("parameters", {}).get("retry_after", 0))
+                except Exception:
+                    retry_after = None
+                last_err = RuntimeError("Telegram 429 (rate limit)")
+                if retry_after:
+                    # уважаем retry_after, но не растягиваем сверх разумного
+                    delays = (retry_after, retry_after, retry_after)
+            elif r.status_code >= 500:
+                last_err = RuntimeError(f"Telegram {method}: HTTP {r.status_code}")
+            else:
+                try:
+                    d = r.json()
+                except Exception as e:
+                    last_err = e
+                else:
+                    if not d.get("ok"):
+                        raise RuntimeError(f"Telegram {method}: {d.get('description')}")
+                    return d
+        # дошёл сюда — была ошибка, ретраим если остались попытки
+        if attempt >= len(delays):
+            break
+        log.warning("Telegram %s: %s — retry %d in %ss",
+                    method, last_err, attempt + 1, delays[attempt])
+        time.sleep(delays[attempt])
+    raise RuntimeError(f"Telegram {method} failed after retries: {last_err}")
 
 
 def _escape(s: str) -> str:
@@ -48,7 +86,11 @@ def send_text(text: str, chat_id: str | int | None = None, try_html: bool = True
             return
         except RuntimeError as e:
             log.warning("HTML-отправка не прошла (%s) — шлю как plain text", e)
-    tg("sendMessage", chat_id=chat_id, text=text.replace("<", "["), disable_web_page_preview=True)
+    try:
+        tg("sendMessage", chat_id=chat_id, text=text.replace("<", "["),
+           disable_web_page_preview=True)
+    except RuntimeError as e:
+        log.warning("plain-отправка не прошла: %s", e)
 
 
 def render_signal(s: dict, prices: dict) -> str:
