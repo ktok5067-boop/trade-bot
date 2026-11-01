@@ -44,12 +44,31 @@ def touch(meta_key: str):
 
 
 def is_session(now_local_dt: datetime) -> bool:
-    """Торговое окно MOEX задаётся по МСК независимо от зоны владельца."""
+    """Активна ли торговля на MOEX прямо сейчас (по МСК).
+
+    Будни: утренняя 06:50-09:50 + основная 09:50-18:50 + вечерняя 19:00-23:50.
+    Выходные: только основная 09:50-18:50 (утренней и вечерней нет).
+    """
     cfg = CONFIG["schedule"]
     msk = now_local_dt.astimezone(MSK_TZ)
-    start = datetime.strptime(cfg["session_start"], "%H:%M").time()
-    end = datetime.strptime(cfg["session_end"], "%H:%M").time()
-    return msk.weekday() < 5 and start <= msk.time() <= end
+    t = msk.time()
+    wd = msk.weekday()  # 0=пн .. 4=пт
+    weekend = wd >= 5
+
+    def in_range(tm, start, end):
+        return start <= tm <= end
+
+    start = datetime.strptime(cfg["session_start"], "%H:%M").time()   # 09:50
+    end = datetime.strptime(cfg["session_end"], "%H:%M").time()       # 18:50
+    morning_start = datetime.strptime(cfg.get("morning_start", "06:50"), "%H:%M").time()
+    evening_start = datetime.strptime(cfg.get("evening_start", "19:00"), "%H:%M").time()
+    evening_end = datetime.strptime(cfg.get("evening_end", "23:50"), "%H:%M").time()
+
+    if weekend:
+        return in_range(t, start, end)          # выходные: только основная
+    return (in_range(t, morning_start, start)   # утренняя
+            or in_range(t, start, end)          # основная
+            or in_range(t, evening_start, evening_end))  # вечерняя
 
 
 def _parse_hhmm(s: str):

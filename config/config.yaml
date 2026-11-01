@@ -136,8 +136,11 @@ schedule:
   news_interval_min: 20        # опрос RSS + Exa
   brief_time: "09:00"          # утренний брифинг (= 02:00 МСК, до открытия MOEX)
   evening_time: "22:00"        # итоги дня (= 15:00 МСК, к концу сессии)
-  session_start: "09:50"       # торговое окно MOEX, по МСК
-  session_end: "19:00"
+  morning_start: "06:50"       # утренняя сессия MOEX (будни), по МСК
+  session_start: "09:50"       # основная сессия MOEX, по МСК
+  session_end: "18:50"         # конец основной сессии, по МСК
+  evening_start: "19:00"       # вечерняя сессия MOEX (будни), по МСК
+  evening_end: "23:50"         # конец вечерней сессии, по МСК
 
 # Правила алертов
 alerts:
