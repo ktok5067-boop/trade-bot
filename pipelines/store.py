@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS trades (
     exit_price NUMERIC,
     qty NUMERIC,
     fee_pct NUMERIC DEFAULT 1.0,
+    mode TEXT NOT NULL DEFAULT 'real',
     note TEXT
 );
 CREATE TABLE IF NOT EXISTS positions (
@@ -47,6 +48,7 @@ CREATE TABLE IF NOT EXISTS positions (
     entry_price NUMERIC,
     stop NUMERIC,
     target NUMERIC,
+    mode TEXT NOT NULL DEFAULT 'real',
     status TEXT NOT NULL DEFAULT 'open'
 );
 CREATE TABLE IF NOT EXISTS signals_log (
@@ -75,6 +77,7 @@ CREATE TABLE IF NOT EXISTS trades (
     exit_price REAL,
     qty REAL,
     fee_pct REAL DEFAULT 1.0,
+    mode TEXT NOT NULL DEFAULT 'real',
     note TEXT
 );
 CREATE TABLE IF NOT EXISTS positions (
@@ -84,6 +87,7 @@ CREATE TABLE IF NOT EXISTS positions (
     entry_price REAL,
     stop REAL,
     target REAL,
+    mode TEXT NOT NULL DEFAULT 'real',
     status TEXT NOT NULL DEFAULT 'open'
 );
 CREATE TABLE IF NOT EXISTS signals_log (
@@ -133,6 +137,10 @@ def init():
             for stmt in _SCHEMA.split(";"):
                 if stmt.strip():
                     cur.execute(stmt)
+            # миграция старых таблиц (добавляем колонку mode, если её нет)
+            for stmt in ("ALTER TABLE trades ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'real'",
+                         "ALTER TABLE positions ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'real'"):
+                cur.execute(stmt)
             cur.close()
             log.info("store: подключено к Supabase Postgres")
             return
@@ -146,6 +154,12 @@ def init():
     for stmt in _SCHEMA_SQLITE.split(";"):
         if stmt.strip():
             cur.execute(stmt)
+    # миграция SQLite (старые таблицы без mode)
+    for col, tbl in (("mode", "trades"), ("mode", "positions")):
+        try:
+            cur.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} TEXT NOT NULL DEFAULT 'real'")
+        except sqlite3.OperationalError:
+            pass  # колонка уже есть
     cur.close()
     _conn.commit()
     log.info("store: локальный SQLite persist.db")
@@ -179,13 +193,14 @@ def _query(sql: str, params: tuple = ()) -> list[dict]:
 # ----------------------- trades -----------------------
 
 def add_trade(ticker: str, entry_price: float, side: str = "long",
-              qty: float | None = None, fee_pct: float = 1.0, note: str = "") -> int:
+              qty: float | None = None, fee_pct: float = 1.0, note: str = "",
+              mode: str = "real") -> int:
     init()
-    _exec("INSERT INTO trades(ticker, side, entry_price, qty, fee_pct, note, created_at) "
-          "VALUES(%s,%s,%s,%s,%s,%s,%s)" if _is_pg() else
-          "INSERT INTO trades(ticker, side, entry_price, qty, fee_pct, note, created_at) "
-          "VALUES(?,?,?,?,?,?,?)",
-          (ticker, side, entry_price, qty, fee_pct, note, _now()))
+    _exec("INSERT INTO trades(ticker, side, entry_price, qty, fee_pct, mode, note, created_at) "
+          "VALUES(%s,%s,%s,%s,%s,%s,%s,%s)" if _is_pg() else
+          "INSERT INTO trades(ticker, side, entry_price, qty, fee_pct, mode, note, created_at) "
+          "VALUES(?,?,?,?,?,?,?,?)",
+          (ticker, side, entry_price, qty, fee_pct, mode, note, _now()))
     row = _query("SELECT MAX(id) AS id FROM trades")
     return row[0]["id"] if row and row[0]["id"] else 0
 
@@ -208,17 +223,22 @@ def close_trade(trade_id: int, exit_price: float, qty: float | None = None, note
             "exit": exit_price, "pnl_pct": round(pnl_pct, 2)}
 
 
-def list_trades(days: int = 30) -> list[dict]:
+def list_trades(days: int = 30, mode: str | None = None) -> list[dict]:
     init()
     if _is_pg():
+        if mode:
+            return _query("SELECT * FROM trades WHERE created_at > now() - interval '%s days' "
+                          "AND mode=%s ORDER BY id", (days, mode))
         return _query("SELECT * FROM trades WHERE created_at > now() - interval '%s days' ORDER BY id", (days,))
     from datetime import timedelta
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    if mode:
+        return _query("SELECT * FROM trades WHERE created_at > ? AND mode=? ORDER BY id", (cutoff, mode))
     return _query("SELECT * FROM trades WHERE created_at > ? ORDER BY id", (cutoff,))
 
 
-def trade_stats(days: int = 30) -> dict:
-    trades = [t for t in list_trades(days) if t["exit_price"] is not None]
+def trade_stats(days: int = 30, mode: str | None = None) -> dict:
+    trades = [t for t in list_trades(days, mode) if t["exit_price"] is not None]
     if not trades:
         return {"closed": 0, "open": 0, "wins": 0, "losses": 0, "win_rate": None,
                 "avg_pnl_pct": None, "total_pnl_pct": 0.0}
@@ -243,13 +263,14 @@ def trade_stats(days: int = 30) -> dict:
 
 # ----------------------- positions -----------------------
 
-def open_position(ticker: str, entry_price: float, stop: float, target: float) -> int:
+def open_position(ticker: str, entry_price: float, stop: float, target: float,
+                  mode: str = "real") -> int:
     init()
-    _exec("INSERT INTO positions(ticker, entry_price, stop, target, status, created_at) "
-          "VALUES(%s,%s,%s,%s,'open',%s)" if _is_pg() else
-          "INSERT INTO positions(ticker, entry_price, stop, target, status, created_at) "
-          "VALUES(?,?,?,?,?,?)",
-          (ticker, entry_price, stop, target, _now()))
+    _exec("INSERT INTO positions(ticker, entry_price, stop, target, mode, status, created_at) "
+          "VALUES(%s,%s,%s,%s,%s,'open',%s)" if _is_pg() else
+          "INSERT INTO positions(ticker, entry_price, stop, target, mode, status, created_at) "
+          "VALUES(?,?,?,?,?,'open',?)",
+          (ticker, entry_price, stop, target, mode, _now()))
     row = _query("SELECT MAX(id) AS id FROM positions")
     return row[0]["id"] if row and row[0]["id"] else 0
 
@@ -261,8 +282,12 @@ def close_position(pos_id: int, reason: str = "manual"):
           (reason, pos_id))
 
 
-def active_positions() -> list[dict]:
+def active_positions(mode: str | None = None) -> list[dict]:
     init()
+    if mode and _is_pg():
+        return _query("SELECT * FROM positions WHERE status='open' AND mode=%s ORDER BY id", (mode,))
+    if mode:
+        return _query("SELECT * FROM positions WHERE status='open' AND mode=? ORDER BY id", (mode,))
     return _query("SELECT * FROM positions WHERE status='open' ORDER BY id")
 
 

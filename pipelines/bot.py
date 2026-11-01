@@ -22,6 +22,7 @@ HELP = """Команды:
 /trade SPBE 178.3 — открыть сделку (записывает в трекер)
 /close 1 182 — закрыть сделку №1 по цене 182 (посчитает P&L)
 /stats — ваша статистика сделок (винрейт, итог)
+/paper — бумажная торговля: бот сам входит/выходит и ведёт статистику
 /backtest — качество прошлых сигналов с учётом комиссии
 /signals — последние сигналы
 /brief — анализ сейчас · /status — состояние бота
@@ -32,7 +33,8 @@ MENU_BUTTONS = [
     ["🎯 Идея", "🏆 Топ 3-4 дня"],
     ["⚡ Пул", "📊 Сигналы"],
     ["📈 Котировка", "💼 Сделки"],
-    ["ℹ️ Статус", "📉 Бэктест"],
+    ["🧪 Бумага", "📉 Бэктест"],
+    ["ℹ️ Статус"],
 ]
 
 
@@ -48,6 +50,7 @@ def _button_to_command(text: str) -> str | None:
         "📊 Сигналы": "/signals",
         "📈 Котировка": "/quote",
         "💼 Сделки": "/stats",
+        "🧪 Бумага": "/paper",
         "📉 Бэктест": "/backtest",
         "ℹ️ Статус": "/status",
     }
@@ -425,9 +428,24 @@ def handle_update(msg: dict):
                           f"{r['entry']:g} → {r['exit']:g} ₽\n"
                           f"Итог (с учётом комиссии): <b>{r['pnl_pct']:+.2f}%</b>", chat_id)
 
+    elif text.startswith("/paper"):
+        from . import store
+        pos = store.active_positions(mode="paper")
+        stats = store.trade_stats(30, mode="paper")
+        open_lines = "\n".join(
+            f"• {p['ticker']}: вход {float(p['entry_price']):g} · стоп {float(p['stop']):g} · "
+            f"цель {float(p['target']):g}" for p in pos) or "• открытых нет"
+        wr = f"{stats['win_rate']}%" if stats['win_rate'] is not None else "—"
+        deliver.send_text(
+            f"🧪 <b>Бумажная торговля</b> (бот сам входит по вердиктам и выходит по цели/стопу)\n\n"
+            f"Открыто сейчас:\n{open_lines}\n\n"
+            f"Результаты (30 дней):\n"
+            f"• закрыто: {stats['closed']} · винрейт: {wr}\n"
+            f"• итог: <b>{stats['total_pnl_pct']:+.2f}%</b>", chat_id)
+
     elif text.startswith("/stats"):
         from . import store
-        s = store.trade_stats(30)
+        s = store.trade_stats(30, mode="real")
         if not s["closed"]:
             deliver.send_text("Закрытых сделок пока нет. Открывайте через /trade, "
                               "закрывайте через /close.", chat_id)

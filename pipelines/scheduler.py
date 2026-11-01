@@ -244,16 +244,76 @@ def check_positions():
         last = float(q["last"])
         stop = float(p["stop"])
         target = float(p["target"])
+        mode = p.get("mode") or "real"
         if last <= stop:
-            deliver.send_text(
-                f"🛑 <b>СТОП пробит</b> — {ticker}\n"
-                f"Цена {last:g} ≤ стоп {stop:g} ₽. Рассмотрите выход.")
-            store.close_position(p["id"], "stop_hit")
+            if mode == "paper":
+                _paper_close(p, last, "stop")
+            else:
+                deliver.send_text(
+                    f"🛑 <b>СТОП пробит</b> — {ticker}\n"
+                    f"Цена {last:g} ≤ стоп {stop:g} ₽. Рассмотрите выход.")
+                store.close_position(p["id"], "stop_hit")
         elif last >= target:
-            deliver.send_text(
-                f"🎯 <b>ЦЕЛЬ достигнута</b> — {ticker}\n"
-                f"Цена {last:g} ≥ цель {target:g} ₽. Фиксируйте прибыль.")
-            store.close_position(p["id"], "target_hit")
+            if mode == "paper":
+                _paper_close(p, last, "target")
+            else:
+                deliver.send_text(
+                    f"🎯 <b>ЦЕЛЬ достигнута</b> — {ticker}\n"
+                    f"Цена {last:g} ≥ цель {target:g} ₽. Фиксируйте прибыль.")
+                store.close_position(p["id"], "target_hit")
+
+
+def _paper_close(p: dict, exit_price: float, reason: str):
+    """Закрыть бумажную позицию и записать результат в трекер (trades)."""
+    from . import store
+    store.close_position(p["id"], reason + "_hit")
+    tid = store.add_trade(p["ticker"], float(p["entry_price"]),
+                          note=f"paper:{reason}", mode="paper")
+    r = store.close_trade(tid, exit_price)
+    emoji = "🟢" if (r and r["pnl_pct"] > 0) else "🔴"
+    deliver.send_text(
+        f"{emoji} <b>Бумажная сделка закрыта</b> — {p['ticker']} ({reason})\n"
+        f"{float(p['entry_price']):g} → {exit_price:g} ₽ · "
+        f"итог <b>{r['pnl_pct'] if r else 0:+.2f}%</b>")
+
+
+def paper_trading():
+    """Бумажная торговля: авто-вход по вердикту пула (если paper_trading: true).
+
+    Раз в paper_interval_min смотрим вердикт каждой бумаги пула; если
+    "enter" и по бумаге нет открытой бумажной позиции — открываем её
+    со стопом/целью из вердикта. Выход — в check_positions().
+    """
+    from . import indicators, intraday, store
+    if not CONFIG.get("intraday", {}).get("paper_trading", False):
+        return
+    try:
+        open_pos = {p["ticker"] for p in store.active_positions(mode="paper")}
+        idx = fetch_quotes.fetch_index()
+        news = db.recent_news(hours=48, limit=40)
+        for t in db.get_pool():
+            if t in open_pos:
+                continue
+            try:
+                bars = intraday.fetch_bars(t)
+                ind = intraday.analyze_bars(bars)
+                if not ind:
+                    continue
+                daily_ind = indicators.compute(db.get_candles(t))
+                v = intraday.verdict(t, ind, daily_ind, idx=idx, news=news)
+            except Exception as e:
+                log.warning("paper verdict %s: %s", t, e)
+                continue
+            if v["call"] == "enter":
+                store.open_position(t, float(v["entry"]), float(v["stop"]),
+                                    float(v["target"]), mode="paper")
+                deliver.send_text(
+                    f"🧪 <b>Бумажный вход</b> — {t}\n"
+                    f"{v['entry']:g} ₽ · стоп {v['stop']:g} · цель {v['target']:g}\n"
+                    f"балл {v['score']}, подтверждений {len(v['confirmations'])}")
+                log.info("paper open %s", t)
+    except Exception as e:
+        log.warning("paper_trading: %s", e)
 
 
 def healthcheck_ping(ok: bool = True):
@@ -294,6 +354,12 @@ def run_cycle():
     if is_session(now) and minutes_since("last_poscheck") >= 3:
         touch("last_poscheck")
         check_positions()
+        ran = True
+
+    # --- бумажная торговля: авто-вход по вердиктам пула ---
+    if is_session(now) and minutes_since("last_paper") >= int(CONFIG.get("intraday", {}).get("paper_interval_min", 15)):
+        touch("last_paper")
+        paper_trading()
         ran = True
 
     # --- итоги интрадея: первый цикл после закрытия сессии (один раз в день) ---
