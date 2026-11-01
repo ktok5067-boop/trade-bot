@@ -633,13 +633,27 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None) -> dict:
     if not atr:  # фолбек: размах дня как прокси волатильности
         atr = (hi - lo) or (last * 0.01)
     stop = round(entry - atr, 4)
-    target = round(entry + 1.5 * atr, 4)
+    # цель растянута (target_atr × ATR), чтобы после комиссии оставалась прибыль
+    target = round(entry + float(_cfg("target_atr", 2.0)) * atr, 4)
+
+    # --- учёт издержек (комиссия вход+выход, % от движения) ---
+    fee = float(_cfg("fee_pct", 1.0))
+    min_net = float(_cfg("min_net_pct", 1.5))
+    gross_pct = (target - entry) / entry * 100 if entry else 0
+    net_pct = gross_pct - fee  # чистая прибыль после комиссии
+    # если сетап не окупает комиссию — вход бессмыслен
+    fee_blocked = net_pct < min_net
+    if fee_blocked:
+        score -= 2.0
+        reasons.append(f"издержки {fee}% съедают потенциал: чистая ≈ {net_pct:.1f}% "
+                       f"(нужно ≥ {min_net:.1f}%) (−2)")
+
     # ближайший уровень поддержки — доп. ориентир (не сам стоп)
     sup_ref = levels.get("nearest_support")
     res_ref = levels.get("nearest_resistance")
     risk_pct = round((entry - stop) / entry * 100, 2) if stop and entry else None
 
-    if score >= 2.0:
+    if score >= 2.0 and not fee_blocked:
         call = "enter"
     elif score >= 0.5:
         call = "wait"
@@ -651,6 +665,8 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None) -> dict:
         "entry": entry, "stop": stop, "target": target,
         "risk_pct": risk_pct, "reasons": reasons,
         "sup_ref": sup_ref, "res_ref": res_ref, "atr": atr,
+        "fee_pct": fee, "gross_pct": round(gross_pct, 2),
+        "net_pct": round(net_pct, 2),
     }
 
 
@@ -675,6 +691,10 @@ def _verdict_line(v: dict) -> str:
             rw = (v["target"] - v["entry"]) / (v["entry"] - v["stop"])
             rr = f" · R/R ≈ 1:{max(rw, 0.1):.1f}"
         parts.append(f"Риск: {v['risk_pct']}%{rr}")
+    # издержки и чистая прибыль
+    if v.get("net_pct") is not None:
+        parts.append(f"Движение: {v.get('gross_pct', 0)}% − комиссия {v.get('fee_pct', 0)}% "
+                     f"= чистая ≈ {v['net_pct']}%")
     parts.append("Почему: " + "; ".join(v["reasons"]) if v["reasons"] else "аргументов мало")
     return "\n".join(parts)
 
