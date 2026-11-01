@@ -370,13 +370,13 @@ def run_cycle():
         ran = True
 
     # --- мониторинг активных позиций (цель/стоп) в торговые часы ---
-    if is_session(now) and minutes_since("last_poscheck") >= 3:
+    if is_session(now) and minutes_since("last_poscheck") >= int(CONFIG.get("intraday", {}).get("poscheck_interval_min", 2)):
         touch("last_poscheck")
         check_positions()
         ran = True
 
     # --- бумажная торговля: авто-вход по вердиктам пула ---
-    if is_session(now) and minutes_since("last_paper") >= int(CONFIG.get("intraday", {}).get("paper_interval_min", 15)):
+    if is_session(now) and minutes_since("last_paper") >= int(CONFIG.get("intraday", {}).get("paper_interval_min", 10)):
         touch("last_paper")
         paper_trading()
         ran = True
