@@ -15,15 +15,38 @@ log = logging.getLogger("bot")
 
 API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 HELP = """Команды:
+/idea SPBE — вердикт: входить или нет (стоп/цель/риск)
+/top — что лучше взять на интрадей (3-4 дня)
 /pool — пул внимания (за чем следит интрадей-сканер)
-/pool add SBER — добавить бумагу в пул
-/pool del SBER — убрать из пула
-/quote SBER — котировка (можно по-русски: /quote спб биржа)
-/idea SPBE — торговая идея по интрадею (VWAP, смарт-мани, вход/выход)
+/pool add SBER · /pool del SBER — менять пул
+/quote SBER — котировка (по-русски тоже: /quote спб биржа)
 /signals — последние сигналы
-/brief — запустить анализ сейчас
+/brief — анализ сейчас
 /status — состояние бота
 Голосовое сообщение или просто текст — задайте вопрос."""
+
+# Кнопки-меню (ReplyKeyboardMarkup) — дублируют главные функции
+MENU_BUTTONS = [
+    ["🎯 Идея", "🏆 Топ 3-4 дня"],
+    ["⚡ Пул", "📊 Сигналы"],
+    ["📈 Котировка", "ℹ️ Статус"],
+]
+
+
+def _menu_keyboard() -> dict:
+    return {"keyboard": MENU_BUTTONS, "resize_keyboard": True, "one_time_keyboard": False}
+
+
+def _button_to_command(text: str) -> str | None:
+    m = {
+        "🎯 Идея": "/idea",
+        "🏆 Топ 3-4 дня": "/top",
+        "⚡ Пул": "/pool",
+        "📊 Сигналы": "/signals",
+        "📈 Котировка": "/quote",
+        "ℹ️ Статус": "/status",
+    }
+    return m.get(text)
 
 
 def _authorized(chat_id: int) -> bool:
@@ -208,8 +231,15 @@ def handle_update(msg: dict):
     if not text:
         return
 
+    # Кнопки меню → команды
+    btn = _button_to_command(text)
+    if btn:
+        text = btn
+        if text == "/quote":
+            text = "/quote"  # без аргумента — спросим в идее ниже
+
     if text.startswith("/start") or text.startswith("/help"):
-        deliver.send_text(HELP, chat_id)
+        deliver.send_text(HELP, chat_id, reply_markup=_menu_keyboard())
     elif text.startswith("/status"):
         n = len(db.recent_news(hours=24, limit=1000))
         s = len(db.signals_since(hours=24))
@@ -296,7 +326,7 @@ def handle_update(msg: dict):
             t = resolved[0] if resolved else ""
         if not t:
             t = pool[0] if pool else "SPBE"
-        deliver.send_text(f"Считаю интрадей-картину {t}…", chat_id)
+        deliver.send_text(f"Считаю {t}…", chat_id)
         try:
             from . import indicators, intraday
             bars = intraday.fetch_bars(t)
@@ -309,27 +339,46 @@ def handle_update(msg: dict):
                 daily_ind = indicators.compute(db.get_candles(t))
             except Exception:
                 pass
-            daily_line = indicators.to_prompt_line(t, daily_ind) if daily_ind else f"{t}: дневных данных нет"
+            v = intraday.verdict(t, ind, daily_ind)
+            daily_line = indicators.to_prompt_line(t, daily_ind) if daily_ind else ""
+            line = intraday.summary_line(t, ind)
             events = intraday.detect_events(t, ind)
             ev_lines = "\n".join(
                 f"• {intraday.RUS.get(e['type'], e['type'])} (движение {e['move']:+.2f}%, объём x{e['vol']})"
                 for e in events) or "• активных событий нет — рынок спокоен"
-            sys = ("Ты — трейдер-споттер на Мосбирже, зарабатываешь на внутридневной волатильности. "
-                   "По данным интрадей-свечей (10м) и дневному теханализу дай план: зона входа, "
-                   "цель, стоп, что делать при пробое. Кратко (до 120 слов), по-русски, "
-                   "учитывай VWAP, объёмные импульсы (смарт-мани) и положение в диапазоне дня. "
-                   "Если данные противоречивы — скажи 'сидим на заборе'.")
-            user = (f"{intraday.summary_line(t, ind)}\n"
-                    f"VWAP {ind['vwap']}, SMA5 {ind['sma5']}, SMA20 {ind['sma20']}\n"
-                    f"События сейчас:\n{ev_lines}\n\nДневная картина: {daily_line}")
-            answer = llm.chat([{"role": "system", "content": sys},
-                               {"role": "user", "content": user}],
-                              max_tokens=500, temperature=0.3)
-            deliver.send_text(f"🎯 <b>{t} — интрадей-план</b>\n"
-                              f"{intraday.summary_line(t, ind)}\n\n{answer}", chat_id)
+            body = (f"🎯 <b>{t}</b>\n{line}\n\n"
+                    f"{intraday._verdict_line(v)}\n\n"
+                    f"События:\n{ev_lines}")
+            if daily_line:
+                body += f"\n\nДневная: {daily_line}"
+            deliver.send_text(body, chat_id)
         except Exception as e:
             log.exception("idea failed")
             deliver.send_text(f"Ошибка идеи: {e}", chat_id)
+
+    elif text.startswith("/top"):
+        deliver.send_text("Сканирую рынок на лучшие сетапы (3-4 дня)… это ~1 минута", chat_id)
+        try:
+            from . import intraday
+            tickers = [w["ticker"] for w in fetch_quotes.watchlist()]
+            top = intraday.screener(tickers, top_n=3)
+            if not top:
+                deliver.send_text("Не удалось получить данные ни по одной бумаге.", chat_id)
+                return
+            out = ["🏆 <b>Топ сетапов на интрадей (3-4 дня)</b>\n"]
+            for i, s in enumerate(top, 1):
+                v = s["verdict"]
+                out.append(f"{i}. <b>{s['ticker']}</b> — {intraday._verdict_line(v).splitlines()[0]}")
+                out.append(f"   {s['ticker']}: {s['ind']['last']:.4g} ₽ · тренд {s['daily_trend']} · "
+                           f"балл {v['score']}")
+                if v["entry"] and v["stop"] and v["target"]:
+                    out.append(f"   вход {v['entry']:.4g} → цель {v['target']:.4g} · стоп {v['stop']:.4g} "
+                               f"(риск {v['risk_pct']}%)")
+            out.append("\nРазбор картины, не рекомендация.")
+            deliver.send_text("\n".join(out), chat_id)
+        except Exception as e:
+            log.exception("top failed")
+            deliver.send_text(f"Ошибка скринера: {e}", chat_id)
 
     elif text.startswith("/signals"):
         rows = db.signals_since(hours=24)

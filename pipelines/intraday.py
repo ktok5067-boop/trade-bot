@@ -512,3 +512,205 @@ def summary_line(secid: str, ind: dict) -> str:
     rp = f", {ind['range_pos']}% диапазона дня" if ind["range_pos"] is not None else ""
     return (f"{secid}: {ind['last']:.4g}₽ за день {ind['chg_day']:+.2f}%{vw}{rp}, "
             f"15м {ind['move_15m']:+.2f}%, объём x{ind['vol_ratio']}, RSI(10м) {ind['rsi14']}")
+
+
+# ---------------------------------------------------------------------------
+# Вердикт «входить / не входить» для спота (лонг-фокус: шорт на споте недоступен)
+# ---------------------------------------------------------------------------
+
+def verdict(secid: str, ind: dict, daily_ind: dict | None = None) -> dict:
+    """Скоринговый вердикт по бумаге.
+
+    Возвращает dict:
+      call: "enter" | "wait" | "avoid"
+      side: "long" (для спота иных нет; avoid = не входить вовсе)
+      entry / stop / target / risk_pct (в рублях и %)
+      score: float, reasons: [str]
+    """
+    last = ind["last"]
+    vwap = ind["vwap"]
+    rsi = ind["rsi14"]
+    rng_pos = ind["range_pos"]
+    levels = ind.get("levels") or {}
+    lo, hi = ind["day_low"], ind["day_high"]
+
+    score = 0.0
+    reasons: list[str] = []
+
+    # 1. Дневной тренд (контекст 3-4 дня)
+    if daily_ind:
+        tr = daily_ind.get("trend")
+        if tr == "восходящий":
+            score += 1.5
+            reasons.append("дневной тренд восходящий (+1.5)")
+        elif tr == "нисходящий":
+            score -= 1.5
+            reasons.append("дневной тренд нисходящий (−1.5)")
+        else:
+            reasons.append("дневной тренд боковой (0)")
+        if daily_ind.get("rsi14") is not None:
+            if daily_ind["rsi14"] > 70:
+                score -= 0.5
+                reasons.append("дневной RSI >70 — перегрев (−0.5)")
+            elif daily_ind["rsi14"] < 35:
+                score += 0.5
+                reasons.append("дневной RSI <35 — перепроданность (+0.5)")
+
+    # 2. Позиция относительно VWAP
+    if vwap:
+        if last > vwap:
+            score += 0.5
+            reasons.append("цена выше VWAP (+0.5)")
+        else:
+            score -= 0.5
+            reasons.append("цена ниже VWAP (−0.5)")
+
+    # 3. Интрадей RSI
+    if rsi is not None:
+        if rsi <= 25:
+            score += 0.5
+            reasons.append(f"RSI(10м) {rsi} — перепродано, отскок возможен (+0.5)")
+        elif rsi >= 75:
+            score -= 1.0
+            reasons.append(f"RSI(10м) {rsi} — перегрев, догонять опасно (−1)")
+        elif 40 <= rsi <= 60:
+            score += 0.5
+            reasons.append(f"RSI(10м) {rsi} — нейтральная зона, есть топливо (+0.5)")
+
+    # 4. Положение в диапазоне дня
+    if rng_pos is not None:
+        if rng_pos >= 97:
+            score -= 0.5
+            reasons.append(f"цена у потолка дня ({rng_pos}%) (−0.5)")
+        elif 50 <= rng_pos < 90:
+            score += 0.5
+            reasons.append(f"цена в верхней половине дня ({rng_pos}%) (+0.5)")
+
+    # 5. События смарт-мани
+    events = detect_events(secid, ind)
+    pos_ev = {"SPRING", "DELTA_DIV_POS", "LEVEL_TEST", "ABSORPTION"}
+    neg_ev = {"UPTHRUST", "DELTA_DIV_NEG", "SPIKE_DOWN", "BREAK_LOW"}
+    for e in events:
+        t = e["type"]
+        if t == "SPRING":
+            score += 1.5
+            reasons.append("SPRING — смыв продавцов у лоу (+1.5)")
+        elif t == "DELTA_DIV_POS":
+            score += 1.0
+            reasons.append("скрытая покупка (дельта растёт) (+1)")
+        elif t in ("BREAK_HIGH",) and rng_pos is not None and rng_pos >= 99:
+            score += 1.0
+            reasons.append("пробой максимума дня (+1)")
+        elif t == "VOL_NODE":
+            if e.get("detail") == "false_breakout":
+                score -= 1.0
+                reasons.append("ложный пробой POC (−1)")
+            else:
+                score += 1.0
+                reasons.append("пробой объёмного узла (+1)")
+        elif t in neg_ev:
+            score -= 1.0
+            reasons.append(f"{RUS.get(t, t)} — против лонга (−1)")
+        elif t in pos_ev:
+            score += 0.5
+            reasons.append(f"{RUS.get(t, t)} (+0.5)")
+
+    # 6. Участие объёма
+    vol = ind.get("vol_ratio")
+    if vol is not None:
+        if vol >= 1.5:
+            score += 0.5
+            reasons.append(f"объём x{vol} — участие крупных (+0.5)")
+        elif vol <= 0.4:
+            score -= 0.5
+            reasons.append(f"объём x{vol} — рынок выдохся (−0.5)")
+
+    # Вход/стоп/цель: стоп по ATR (не по ближайшему тику, чтобы шум не выбивал)
+    entry = last
+    atr = None
+    if daily_ind and daily_ind.get("atr14"):
+        atr = daily_ind["atr14"]
+    if not atr:  # фолбек: размах дня как прокси волатильности
+        atr = (hi - lo) or (last * 0.01)
+    stop = round(entry - atr, 4)
+    target = round(entry + 1.5 * atr, 4)
+    # ближайший уровень поддержки — доп. ориентир (не сам стоп)
+    sup_ref = levels.get("nearest_support")
+    res_ref = levels.get("nearest_resistance")
+    risk_pct = round((entry - stop) / entry * 100, 2) if stop and entry else None
+
+    if score >= 2.0:
+        call = "enter"
+    elif score >= 0.5:
+        call = "wait"
+    else:
+        call = "avoid"
+
+    return {
+        "call": call, "side": "long", "score": round(score, 1),
+        "entry": entry, "stop": stop, "target": target,
+        "risk_pct": risk_pct, "reasons": reasons,
+        "sup_ref": sup_ref, "res_ref": res_ref, "atr": atr,
+    }
+
+
+def _verdict_line(v: dict) -> str:
+    call, side = v["call"], v["side"]
+    if call == "enter":
+        head = "✅ ВХОД рекомендован (лонг)"
+    elif call == "wait":
+        head = "⏸ ЖДАТЬ подтверждения"
+    else:
+        head = "⛔ НЕ входить"
+    parts = [head, f"Балл сетапа: {v['score']}"]
+    if v["entry"]:
+        parts.append(f"Вход: {v['entry']:.4g} ₽")
+    if v["stop"]:
+        parts.append(f"Стоп: {v['stop']:.4g} ₽")
+    if v["target"]:
+        parts.append(f"Цель: {v['target']:.4g} ₽")
+    if v["risk_pct"] is not None:
+        rr = ""
+        if v["stop"] and v["target"] and v["entry"]:
+            rw = (v["target"] - v["entry"]) / (v["entry"] - v["stop"])
+            rr = f" · R/R ≈ 1:{max(rw, 0.1):.1f}"
+        parts.append(f"Риск: {v['risk_pct']}%{rr}")
+    parts.append("Почему: " + "; ".join(v["reasons"]) if v["reasons"] else "аргументов мало")
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Скринер «что взять на интрадей 3-4 дня»
+# ---------------------------------------------------------------------------
+
+def screener(tickers: list[str], top_n: int = 3) -> list[dict]:
+    """Ранжирует бумаги по качеству сетапа (свинг 3-4 дня).
+
+    Для каждой: дневные свечи (тренд) + интрадей-картина + вердикт.
+    Возвращает список {ticker, verdict, daily_trend, note} по убыванию score.
+    """
+    from . import fetch_quotes, indicators
+    scored = []
+    for t in tickers:
+        try:
+            daily_ind = None
+            try:
+                fetch_quotes.fetch_candles(t, days=90)  # свежие дневные свечи
+                daily_ind = indicators.compute(db.get_candles(t, limit=80))
+            except Exception:
+                pass
+            bars = fetch_bars(t)
+            ind = analyze_bars(bars)
+            if not ind:
+                continue
+            v = verdict(t, ind, daily_ind)
+            scored.append({
+                "ticker": t,
+                "verdict": v,
+                "ind": ind,
+                "daily_trend": (daily_ind or {}).get("trend", "—"),
+            })
+        except Exception as e:
+            log.warning("screener %s: %s", t, e)
+    scored.sort(key=lambda x: -x["verdict"]["score"])
+    return scored[:top_n]

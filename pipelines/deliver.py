@@ -74,21 +74,23 @@ def _escape(s: str) -> str:
     return html.escape(str(s), quote=False)
 
 
-def send_text(text: str, chat_id: str | int | None = None, try_html: bool = True):
+def send_text(text: str, chat_id: str | int | None = None, try_html: bool = True,
+              reply_markup: dict | None = None):
     chat_id = chat_id or REPORT_CHAT_ID
     if not chat_id:
         log.warning("Не задан REPORT_CHAT_ID/TELEGRAM_ALLOWED_IDS — некому слать отчёт")
         return
+    kwargs = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+    if reply_markup:
+        kwargs["reply_markup"] = reply_markup
     if try_html:
         try:
-            tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
-               disable_web_page_preview=True)
+            tg("sendMessage", parse_mode="HTML", **kwargs)
             return
         except RuntimeError as e:
             log.warning("HTML-отправка не прошла (%s) — шлю как plain text", e)
     try:
-        tg("sendMessage", chat_id=chat_id, text=text.replace("<", "["),
-           disable_web_page_preview=True)
+        tg("sendMessage", text=text.replace("<", "["), **{k: v for k, v in kwargs.items() if k != "text"})
     except RuntimeError as e:
         log.warning("plain-отправка не прошла: %s", e)
 

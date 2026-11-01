@@ -74,6 +74,39 @@ watchlist:
   - ticker: TRNFP
     name: Транснефть-ап
     keywords: ["транснефть"]
+  - ticker: NLMK
+    name: НЛМК
+    keywords: ["нлмк", "новолипецкий"]
+  - ticker: ALRS
+    name: АЛРОСА
+    keywords: ["алроса"]
+  - ticker: FIVE
+    name: X5 Group
+    keywords: ["x5", "пятёрочка", "пятерочка"]
+  - ticker: OZON
+    name: Озон
+    keywords: ["озон", "ozon"]
+  - ticker: CBOM
+    name: МКБ
+    keywords: ["мкб", "московский кредитный"]
+  - ticker: AFKS
+    name: АФК Система
+    keywords: ["афк система", "система"]
+  - ticker: HYDR
+    name: РусГидро
+    keywords: ["русгидро", "гидро"]
+  - ticker: FEES
+    name: Россети
+    keywords: ["россети", "фск"]
+  - ticker: POLY
+    name: Полиметалл
+    keywords: ["полиметалл"]
+  - ticker: PIKK
+    name: ПИК
+    keywords: ["пик", "пкв"]
+  - ticker: MAGN
+    name: ММК
+    keywords: ["ммк", "магнитогорский"]
 
 # RSS-ленты (базовый бесплатный поток новостей)
 feeds:
