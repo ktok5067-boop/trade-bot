@@ -219,6 +219,43 @@ def intraday_summary():
 
 
 
+def check_positions():
+    """Мониторинг активных позиций: алерт при достижении цели или пробое стопа."""
+    from . import store
+    try:
+        positions = store.active_positions()
+    except Exception as e:
+        log.warning("positions read: %s", e)
+        return
+    if not positions:
+        return
+    try:
+        prices = db.latest_prices() or {}
+        if not prices:
+            fetch_quotes.fetch_snapshot()
+            prices = db.latest_prices() or {}
+    except Exception:
+        prices = {}
+    for p in positions:
+        ticker = p["ticker"]
+        q = prices.get(ticker)
+        if not q or not q.get("last"):
+            continue
+        last = float(q["last"])
+        stop = float(p["stop"])
+        target = float(p["target"])
+        if last <= stop:
+            deliver.send_text(
+                f"🛑 <b>СТОП пробит</b> — {ticker}\n"
+                f"Цена {last:g} ≤ стоп {stop:g} ₽. Рассмотрите выход.")
+            store.close_position(p["id"], "stop_hit")
+        elif last >= target:
+            deliver.send_text(
+                f"🎯 <b>ЦЕЛЬ достигнута</b> — {ticker}\n"
+                f"Цена {last:g} ≥ цель {target:g} ₽. Фиксируйте прибыль.")
+            store.close_position(p["id"], "target_hit")
+
+
 def healthcheck_ping(ok: bool = True):
     if not HEALTHCHECK_URL:
         return
@@ -251,6 +288,12 @@ def run_cycle():
     if is_session(now) and minutes_since("last_scan") >= cfg.get("scan_interval_min", 5):
         touch("last_scan")
         intraday_scan()
+        ran = True
+
+    # --- мониторинг активных позиций (цель/стоп) в торговые часы ---
+    if is_session(now) and minutes_since("last_poscheck") >= 3:
+        touch("last_poscheck")
+        check_positions()
         ran = True
 
     # --- итоги интрадея: первый цикл после закрытия сессии (один раз в день) ---

@@ -199,4 +199,9 @@ def run_analysis(kind: str) -> list[dict]:
         signals = _fallback_signals(prices)
 
     db.save_signal(kind, signals)
+    try:  # дублируем в постоянное хранилище для бэктеста (переживает рестарты)
+        from . import store
+        store.log_signal(kind, signals)
+    except Exception as e:
+        log.warning("store.log_signal: %s", e)
     return signals

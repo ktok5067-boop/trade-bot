@@ -518,14 +518,38 @@ def summary_line(secid: str, ind: dict) -> str:
 # Вердикт «входить / не входить» для спота (лонг-фокус: шорт на споте недоступен)
 # ---------------------------------------------------------------------------
 
-def verdict(secid: str, ind: dict, daily_ind: dict | None = None) -> dict:
-    """Скоринговый вердикт по бумаге.
+_EVENT_RISK_WORDS = ["дивиденд", "отчёт", "отчет", "собрание", "заседание", "цб",
+                     "ставк", "решение", "санкци", "выкуп", "допэмисси", "сплит",
+                     "делистинг", "спб бирж"]
+
+
+def _event_risk(secid: str, news: list[dict] | None) -> str | None:
+    """Риск события: важная новость-катализатор по бумаге в ближайшие дни.
+
+    Возвращает строку-причину риска или None.
+    """
+    if not news:
+        return None
+    q = secid.lower()
+    for n in news:
+        title = (n.get("title") or "").lower()
+        tickers = [t.lower() for t in (n.get("tickers") or [])]
+        if secid.lower() not in tickers and q not in title:
+            continue
+        for w in _EVENT_RISK_WORDS:
+            if w in title:
+                return n.get("title", "")[:60]
+    return None
+
+
+def verdict(secid: str, ind: dict, daily_ind: dict | None = None,
+            idx: dict | None = None, news: list[dict] | None = None) -> dict:
+    """Скоринговый вердикт по бумаге (лонг-фокус для спота).
 
     Возвращает dict:
       call: "enter" | "wait" | "avoid"
-      side: "long" (для спота иных нет; avoid = не входить вовсе)
-      entry / stop / target / risk_pct (в рублях и %)
-      score: float, reasons: [str]
+      entry / stop / target / risk_pct / score / reasons
+      confirmations: число независимых подтверждений (конфлюэнс)
     """
     last = ind["last"]
     vwap = ind["vwap"]
@@ -536,6 +560,7 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None) -> dict:
 
     score = 0.0
     reasons: list[str] = []
+    confirmations: set[str] = set()  # независимые подтверждения для конфлюэнса
 
     # 1. Дневной тренд (контекст 3-4 дня)
     if daily_ind:
@@ -543,6 +568,7 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None) -> dict:
         if tr == "восходящий":
             score += 1.5
             reasons.append("дневной тренд восходящий (+1.5)")
+            confirmations.add("trend")
         elif tr == "нисходящий":
             score -= 1.5
             reasons.append("дневной тренд нисходящий (−1.5)")
@@ -555,12 +581,14 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None) -> dict:
             elif daily_ind["rsi14"] < 35:
                 score += 0.5
                 reasons.append("дневной RSI <35 — перепроданность (+0.5)")
+                confirmations.add("trend")
 
     # 2. Позиция относительно VWAP
     if vwap:
         if last > vwap:
             score += 0.5
             reasons.append("цена выше VWAP (+0.5)")
+            confirmations.add("vwap")
         else:
             score -= 0.5
             reasons.append("цена ниже VWAP (−0.5)")
@@ -570,6 +598,7 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None) -> dict:
         if rsi <= 25:
             score += 0.5
             reasons.append(f"RSI(10м) {rsi} — перепродано, отскок возможен (+0.5)")
+            confirmations.add("rsi")
         elif rsi >= 75:
             score -= 1.0
             reasons.append(f"RSI(10м) {rsi} — перегрев, догонять опасно (−1)")
@@ -595,12 +624,15 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None) -> dict:
         if t == "SPRING":
             score += 1.5
             reasons.append("SPRING — смыв продавцов у лоу (+1.5)")
+            confirmations.add("event")
         elif t == "DELTA_DIV_POS":
             score += 1.0
             reasons.append("скрытая покупка (дельта растёт) (+1)")
+            confirmations.add("event")
         elif t in ("BREAK_HIGH",) and rng_pos is not None and rng_pos >= 99:
             score += 1.0
             reasons.append("пробой максимума дня (+1)")
+            confirmations.add("event")
         elif t == "VOL_NODE":
             if e.get("detail") == "false_breakout":
                 score -= 1.0
@@ -608,12 +640,14 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None) -> dict:
             else:
                 score += 1.0
                 reasons.append("пробой объёмного узла (+1)")
+                confirmations.add("event")
         elif t in neg_ev:
             score -= 1.0
             reasons.append(f"{RUS.get(t, t)} — против лонга (−1)")
         elif t in pos_ev:
             score += 0.5
             reasons.append(f"{RUS.get(t, t)} (+0.5)")
+            confirmations.add("event")
 
     # 6. Участие объёма
     vol = ind.get("vol_ratio")
@@ -621,9 +655,28 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None) -> dict:
         if vol >= 1.5:
             score += 0.5
             reasons.append(f"объём x{vol} — участие крупных (+0.5)")
+            confirmations.add("volume")
         elif vol <= 0.4:
             score -= 0.5
             reasons.append(f"объём x{vol} — рынок выдохся (−0.5)")
+
+    # 7. Контекст индекса (IMOEX) — лонг против падающего рынка опасен
+    idx_chg = None
+    if idx and idx.get("chg_pct") is not None:
+        idx_chg = float(idx["chg_pct"])
+        if idx_chg <= -1.0:
+            score -= 1.0
+            reasons.append(f"IMOEX {idx_chg:+.2f}% — рынок падает, против тренда (−1)")
+        elif idx_chg >= 1.0:
+            score += 0.5
+            reasons.append(f"IMOEX {idx_chg:+.2f}% — рынок растёт, попутный ветер (+0.5)")
+            confirmations.add("index")
+
+    # 8. Риск события (event risk): новости-катализаторы в ближайшие дни
+    event_risk = _event_risk(secid, news)
+    if event_risk:
+        score -= 1.0
+        reasons.append(f"риск события: {event_risk} (−1)")
 
     # Вход/стоп/цель: стоп по ATR (не по ближайшему тику, чтобы шум не выбивал)
     entry = last
@@ -653,6 +706,14 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None) -> dict:
     res_ref = levels.get("nearest_resistance")
     risk_pct = round((entry - stop) / entry * 100, 2) if stop and entry else None
 
+    # конфлюэнс: вход только при >= 2 независимых подтверждений (иначе слабый сигнал)
+    n_conf = len(confirmations)
+    need_conf = int(_cfg("min_confirmations", 2))
+    weak_confluence = n_conf < need_conf
+    if weak_confluence and score >= 2.0:
+        score = min(score, 1.5)  # не дотягивает до "enter" без конфлюэнса
+        reasons.append(f"мало независимых подтверждений ({n_conf}<{need_conf}) — ослабляю")
+
     if score >= 2.0 and not fee_blocked:
         call = "enter"
     elif score >= 0.5:
@@ -667,6 +728,8 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None) -> dict:
         "sup_ref": sup_ref, "res_ref": res_ref, "atr": atr,
         "fee_pct": fee, "gross_pct": round(gross_pct, 2),
         "net_pct": round(net_pct, 2),
+        "confirmations": sorted(confirmations),
+        "idx_chg": idx_chg,
     }
 
 
@@ -710,6 +773,11 @@ def screener(tickers: list[str], top_n: int = 3) -> list[dict]:
     Возвращает список {ticker, verdict, daily_trend, note} по убыванию score.
     """
     from . import fetch_quotes, indicators
+    idx = None
+    try:
+        idx = fetch_quotes.fetch_index()
+    except Exception:
+        pass
     scored = []
     for t in tickers:
         try:
@@ -723,7 +791,7 @@ def screener(tickers: list[str], top_n: int = 3) -> list[dict]:
             ind = analyze_bars(bars)
             if not ind:
                 continue
-            v = verdict(t, ind, daily_ind)
+            v = verdict(t, ind, daily_ind, idx=idx)
             scored.append({
                 "ticker": t,
                 "verdict": v,

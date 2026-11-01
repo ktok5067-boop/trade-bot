@@ -17,19 +17,22 @@ API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 HELP = """Команды:
 /idea SPBE — вердикт: входить или нет (стоп/цель/риск)
 /top — что лучше взять на интрадей (3-4 дня)
-/pool — пул внимания (за чем следит интрадей-сканер)
-/pool add SBER · /pool del SBER — менять пул
+/pool — пул внимания · /pool add SBER · /pool del SBER
 /quote SBER — котировка (по-русски тоже: /quote спб биржа)
+/trade SPBE 178.3 — открыть сделку (записывает в трекер)
+/close 1 182 — закрыть сделку №1 по цене 182 (посчитает P&L)
+/stats — ваша статистика сделок (винрейт, итог)
+/backtest — качество прошлых сигналов с учётом комиссии
 /signals — последние сигналы
-/brief — анализ сейчас
-/status — состояние бота
+/brief — анализ сейчас · /status — состояние бота
 Голосовое сообщение или просто текст — задайте вопрос."""
 
 # Кнопки-меню (ReplyKeyboardMarkup) — дублируют главные функции
 MENU_BUTTONS = [
     ["🎯 Идея", "🏆 Топ 3-4 дня"],
     ["⚡ Пул", "📊 Сигналы"],
-    ["📈 Котировка", "ℹ️ Статус"],
+    ["📈 Котировка", "💼 Сделки"],
+    ["ℹ️ Статус", "📉 Бэктест"],
 ]
 
 
@@ -44,6 +47,8 @@ def _button_to_command(text: str) -> str | None:
         "⚡ Пул": "/pool",
         "📊 Сигналы": "/signals",
         "📈 Котировка": "/quote",
+        "💼 Сделки": "/stats",
+        "📉 Бэктест": "/backtest",
         "ℹ️ Статус": "/status",
     }
     return m.get(text)
@@ -339,7 +344,9 @@ def handle_update(msg: dict):
                 daily_ind = indicators.compute(db.get_candles(t))
             except Exception:
                 pass
-            v = intraday.verdict(t, ind, daily_ind)
+            idx = fetch_quotes.fetch_index()
+            news = db.recent_news(hours=48, limit=60)
+            v = intraday.verdict(t, ind, daily_ind, idx=idx, news=news)
             daily_line = indicators.to_prompt_line(t, daily_ind) if daily_ind else ""
             line = intraday.summary_line(t, ind)
             events = intraday.detect_events(t, ind)
@@ -379,6 +386,101 @@ def handle_update(msg: dict):
         except Exception as e:
             log.exception("top failed")
             deliver.send_text(f"Ошибка скринера: {e}", chat_id)
+
+    elif text.startswith("/trade"):
+        from . import store
+        parts = text.split()
+        # /trade SPBE 178.3
+        if len(parts) < 3:
+            deliver.send_text("Формат: /trade SPBE 178.3", chat_id)
+            return
+        t = parts[1].upper()
+        try:
+            price = float(parts[2].replace(",", "."))
+        except ValueError:
+            deliver.send_text("Цена не распознана.", chat_id)
+            return
+        tid = store.add_trade(t, price)
+        deliver.send_text(f"📝 Сделка #{tid}: <b>{t}</b> вход {price:g} ₽ записана.\n"
+                          f"Закрыть: /close {tid} ЦЕНА", chat_id)
+
+    elif text.startswith("/close"):
+        from . import store
+        parts = text.split()
+        if len(parts) < 3:
+            deliver.send_text("Формат: /close 1 182", chat_id)
+            return
+        try:
+            tid = int(parts[1])
+            price = float(parts[2].replace(",", "."))
+        except ValueError:
+            deliver.send_text("Номер сделки или цена не распознаны.", chat_id)
+            return
+        r = store.close_trade(tid, price)
+        if not r:
+            deliver.send_text(f"Сделка #{tid} не найдена.", chat_id)
+            return
+        emoji = "🟢" if r["pnl_pct"] > 0 else ("🔴" if r["pnl_pct"] < 0 else "⚪")
+        deliver.send_text(f"{emoji} Сделка #{r['id']} ({r['ticker']}) закрыта: "
+                          f"{r['entry']:g} → {r['exit']:g} ₽\n"
+                          f"Итог (с учётом комиссии): <b>{r['pnl_pct']:+.2f}%</b>", chat_id)
+
+    elif text.startswith("/stats"):
+        from . import store
+        s = store.trade_stats(30)
+        if not s["closed"]:
+            deliver.send_text("Закрытых сделок пока нет. Открывайте через /trade, "
+                              "закрывайте через /close.", chat_id)
+            return
+        wr = f"{s['win_rate']}%" if s["win_rate"] is not None else "—"
+        deliver.send_text(
+            f"💼 <b>Статистика сделок (30 дней)</b>\n"
+            f"• закрыто: {s['closed']}\n"
+            f"• в плюс: {s['wins']} · в минус: {s['losses']}\n"
+            f"• винрейт: {wr}\n"
+            f"• средняя сделка: {s['avg_pnl_pct']:+.2f}%\n"
+            f"• итог: <b>{s['total_pnl_pct']:+.2f}%</b>", chat_id)
+
+    elif text.startswith("/backtest"):
+        deliver.send_text("Считаю бэктест сигналов…", chat_id)
+        try:
+            from . import store, intraday
+            hist = store.signals_history(30)
+            rows = [h for h in hist if h.get("direction") in ("long", "short")
+                    and h.get("payload")]
+            if not rows:
+                deliver.send_text("Истории сигналов пока нет (она копится с бэктест-логом).", chat_id)
+                return
+            fee = float(intraday._cfg("fee_pct", 1.0))
+            checked = wins = 0
+            total = 0.0
+            for h in rows:
+                p = h.get("payload") or {}
+                ticker = p.get("ticker") or h.get("ticker")
+                direction = p.get("direction") or h.get("direction")
+                entry = db.price_at(ticker, h["created_at"])
+                now_p = (db.quote_stats(ticker) or {}).get("last")
+                if not entry or not now_p:
+                    continue
+                chg = (now_p / entry - 1) * 100
+                net = chg - fee if direction == "long" else -chg - fee
+                checked += 1
+                total += net
+                if net > 0:
+                    wins += 1
+            if not checked:
+                deliver.send_text("Не хватает цен для бэктеста.", chat_id)
+                return
+            wr = wins / checked * 100
+            deliver.send_text(
+                f"📉 <b>Бэктест сигналов (30 дней, комиссия {fee}%)</b>\n"
+                f"• проверено: {checked}\n"
+                f"• в плюс: {wins} ({wr:.0f}%)\n"
+                f"• суммарно: {total:+.2f}%\n"
+                f"• в среднем: {total / checked:+.2f}% за сделку", chat_id)
+        except Exception as e:
+            log.exception("backtest failed")
+            deliver.send_text(f"Ошибка бэктеста: {e}", chat_id)
 
     elif text.startswith("/signals"):
         rows = db.signals_since(hours=24)

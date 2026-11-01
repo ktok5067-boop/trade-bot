@@ -3,3 +3,4 @@ python-dotenv>=1.0
 feedparser>=6.0
 PyYAML>=6.0
 tzdata>=2024.1
+psycopg2-binary>=2.9
