@@ -297,42 +297,44 @@ def _paper_close(p: dict, exit_price: float, reason: str):
 
 
 def paper_trading():
-    """Бумажная торговля: авто-вход по вердикту пула (если paper_trading: true).
+    """Бумажная торговля: авто-вход по вердиктам всего watchlist.
 
-    Раз в paper_interval_min смотрим вердикт каждой бумаги пула; если
-    "enter" и по бумаге нет открытой бумажной позиции — открываем её
-    со стопом/целью из вердикта. Выход — в check_positions().
+    Ранжирует весь watchlist (34 бумаги) по баллу сетапа и открывает
+    бумажные позиции по топ-5 (кроме "avoid"), чтобы статистика набиралась
+    быстро на всех ликвидных бумагах. Выход — в check_positions().
     """
-    from . import indicators, intraday, store
+    from . import intraday, store
     if not CONFIG.get("intraday", {}).get("paper_trading", False):
         return
     try:
         open_pos = {p["ticker"] for p in store.active_positions(mode="paper")}
-        idx = fetch_quotes.fetch_index()
-        news = db.recent_news(hours=48, limit=40)
-        for t in db.get_pool():
-            if t in open_pos:
-                continue
-            try:
-                bars = intraday.fetch_bars(t)
-                ind = intraday.analyze_bars(bars)
-                if not ind:
-                    continue
-                daily_ind = indicators.compute(db.get_candles(t))
-                v = intraday.verdict(t, ind, daily_ind, idx=idx, news=news)
-            except Exception as e:
-                log.warning("paper verdict %s: %s", t, e)
-                continue
-            if v["call"] == "enter":
-                store.open_position(t, float(v["entry"]), float(v["stop"]),
-                                    float(v["target"]), mode="paper")
-                deliver.send_text(
-                    f"🧪 <b>Бумажный вход</b> — {t}\n"
-                    f"{v['entry']:g} ₽ · стоп {v['stop']:g} · цель {v['target']:g}\n"
-                    f"балл {v['score']}, подтверждений {len(v['confirmations'])}")
-                log.info("paper open %s", t)
+        top_n = int(CONFIG.get("intraday", {}).get("paper_top_n", 5))
+        # весь watchlist, ранжированный по баллу (кеш свечей, без спама MOEX)
+        scored = intraday.rank_paper(fetch_quotes.tickers(), top_n=top_n)
     except Exception as e:
-        log.warning("paper_trading: %s", e)
+        log.warning("paper screener: %s", e)
+        return
+    entered = 0
+    for row in scored:
+        t = row["ticker"]
+        v = row["verdict"]
+        if t in open_pos:
+            continue
+        if v["call"] == "avoid":
+            continue  # явно не входить
+        try:
+            store.open_position(t, float(v["entry"]), float(v["stop"]),
+                                float(v["target"]), mode="paper")
+            entered += 1
+            deliver.send_text(
+                f"🧪 <b>Бумажный вход</b> — {t}\n"
+                f"{v['entry']:g} ₽ · стоп {v['stop']:g} · цель {v['target']:g}\n"
+                f"балл {v['score']}, подтверждений {len(v['confirmations'])}")
+            log.info("paper open %s (score %s)", t, v["score"])
+        except Exception as e:
+            log.warning("paper open %s: %s", t, e)
+    if entered:
+        log.info("paper: открыто %d позиций из топ-%d", entered, top_n)
 
 
 def healthcheck_ping(ok: bool = True):

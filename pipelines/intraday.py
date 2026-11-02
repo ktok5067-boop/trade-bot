@@ -802,3 +802,40 @@ def screener(tickers: list[str], top_n: int = 3) -> list[dict]:
             log.warning("screener %s: %s", t, e)
     scored.sort(key=lambda x: -x["verdict"]["score"])
     return scored[:top_n]
+
+
+def rank_paper(tickers: list[str], top_n: int = 5) -> list[dict]:
+    """Лёгкое ранжирование для бумажной торговли (без повторного скачивания свечей).
+
+    Использует уже закешированные дневные свечи (их обновляет update_all при
+    опросе котировок), чтобы не дёргать MOEX каждые 10 минут по 34 бумагам.
+    """
+    from . import fetch_quotes, indicators
+    idx = None
+    try:
+        idx = fetch_quotes.fetch_index()
+    except Exception:
+        pass
+    news = None
+    try:
+        news = db.recent_news(hours=48, limit=40)
+    except Exception:
+        pass
+    scored = []
+    for t in tickers:
+        try:
+            daily_ind = None
+            try:
+                daily_ind = indicators.compute(db.get_candles(t, limit=80))
+            except Exception:
+                pass
+            bars = fetch_bars(t)
+            ind = analyze_bars(bars)
+            if not ind:
+                continue
+            v = verdict(t, ind, daily_ind, idx=idx, news=news)
+            scored.append({"ticker": t, "verdict": v})
+        except Exception as e:
+            log.warning("rank_paper %s: %s", t, e)
+    scored.sort(key=lambda x: -x["verdict"]["score"])
+    return scored[:top_n]
