@@ -13,9 +13,11 @@ SYSTEM_PROMPT = """Ты — опытный аналитик российског
 MACD, SMA20/50, Боллинджер, ATR, диапазон 52 недель, объёмы), плюс индекс IMOEX.
 
 Задача: взвесить НОВОСТНОЙ и ТЕХНИЧЕСКИЙ факторы и выдать по каждому тикеру сигнал.
+Торговля только СПОТ (покупка акций): шорт недоступен.
 
 Правила:
-1. direction: "long" (рост вероятен), "short" (падение вероятно) или "flat" (нет ясного сигнала).
+1. direction: "long" (рост вероятен, есть смысл покупать) или "flat" (нет ясного
+   сигнала / покупать не стоит). "short" НЕ используй — на споте его не исполнить.
 2. confidence: "low" | "medium" | "high".
    high — только когда новостной драйвер И техника смотрят в одну сторону;
    расхождение факторов — не выше medium; противоречие — low или flat.
@@ -29,7 +31,7 @@ MACD, SMA20/50, Боллинджер, ATR, диапазон 52 недель, о�
 7. sources: до 3 ссылок ТОЛЬКО из предоставленного списка новостей.
 
 Ответ — строго JSON:
-{"signals": [{"ticker": "SBER", "direction": "long|short|flat",
+{"signals": [{"ticker": "SBER", "direction": "long|flat",
   "confidence": "low|medium|high", "horizon": "...", "tech_view": "...",
   "rationale": "...", "risks": "...", "sources": [{"title": "...", "url": "..."}]}]}
 Все тикеры из списка обязательны."""
@@ -51,6 +53,12 @@ def _tech_block(pool: list[str]) -> list[str]:
     lines = []
     for t in pool:
         candles = db.get_candles(t)
+        if not candles:  # после деплоя кеш пуст — догружаем дневные свечи
+            try:
+                fetch_quotes.fetch_candles(t, days=120)
+                candles = db.get_candles(t)
+            except Exception:
+                pass
         try:
             ind = indicators.compute(candles)
         except Exception:
@@ -66,17 +74,16 @@ def _performance_line() -> str:
         if row["kind"] not in ("brief", "evening"):
             continue
         for s in row["payload"]:
-            if s["direction"] not in ("long", "short"):
+            if s["direction"] != "long":
                 continue
-            price_then = db.price_at(s["ticker"], row["created_at"])
+            # цена на момент сигнала сохранена в payload — не зависит от эфемерных котировок
+            price_then = s.get("price_at_signal") or db.price_at(s["ticker"], row["created_at"])
             price_now = (db.quote_stats(s["ticker"]) or {}).get("last")
             if not price_then or not price_now:
                 continue
             chg = price_now / price_then - 1
-            ok = (s["direction"] == "long" and chg > 0) or \
-                 (s["direction"] == "short" and chg < 0)
             checked += 1
-            hit += ok
+            hit += chg > 0
     if not checked:
         return "Качество прошлых сигналов: данных пока нет."
     rate = hit / checked
@@ -85,8 +92,7 @@ def _performance_line() -> str:
     return f"Качество прошлых сигналов (7 дней): {hit}/{checked} верных ({rate * 100:.0f}%). {advice}"
 
 
-def build_user_prompt(news: list[dict], prices: dict, idx: dict) -> str:
-    pool = db.get_pool()
+def build_user_prompt(news: list[dict], prices: dict, idx: dict, pool: list[str]) -> str:
     names = {w["ticker"]: w.get("name", t) for w in fetch_quotes.watchlist()}
     parts = [f"Дата анализа (МСК): {db.now_iso()}",
              f"Индекс IMOEX: {idx.get('value', 'n/a')} ({idx.get('chg_pct', 'n/a')}%)",
@@ -110,8 +116,8 @@ def _validate(signals: list, allowed: set[str]) -> list[dict]:
             continue
         direction = str(s.get("direction", "flat")).lower()
         conf = str(s.get("confidence", "low")).lower()
-        if direction not in ("long", "short", "flat"):
-            direction = "flat"
+        if direction not in ("long", "flat"):
+            direction = "flat"  # спот: шорт неисполним — переводим в flat
         if conf not in ("low", "medium", "high"):
             conf = "low"
         sources = [x for x in (s.get("sources") or [])[:3]
@@ -129,10 +135,10 @@ def _validate(signals: list, allowed: set[str]) -> list[dict]:
     return out
 
 
-def _fallback_signals(prices: dict) -> list[dict]:
-    """Если LLM недоступен — сигналы чисто по теханализу пула."""
+def _fallback_signals(prices: dict, pool: list[str]) -> list[dict]:
+    """Если LLM недоступен — сигналы чисто по теханализу (спот: long/flat)."""
     out = []
-    for t in db.get_pool():
+    for t in pool:
         candles = db.get_candles(t)
         try:
             ind = indicators.compute(candles)
@@ -142,12 +148,12 @@ def _fallback_signals(prices: dict) -> list[dict]:
             direction = "flat"
             if ind["trend"] == "восходящий" and (ind["rsi14"] or 50) < 70:
                 direction = "long"
-            elif ind["trend"] == "нисходящий" and (ind["rsi14"] or 50) > 30:
-                direction = "short"
             rationale = (f"LLM недоступен; техника: {ind['trend']} тренд, "
                          f"RSI {ind['rsi14']}, 20д {ind['chg_20d']:+.1f}%"
                          if ind["chg_20d"] is not None else
                          f"LLM недоступен; техника: {ind['trend']} тренд.")
+            if ind["trend"] == "нисходящий":
+                rationale += " Нисходящий тренд — для спота не подходит, ждём разворота."
             tech = indicators.to_prompt_line(t, ind)
         else:
             direction = "flat"
@@ -163,40 +169,60 @@ def _fallback_signals(prices: dict) -> list[dict]:
     return out
 
 
-def run_analysis(kind: str) -> list[dict]:
-    """Собрать контекст, вызвать LLM, провалидировать, сохранить сигналы.
+def _analyze_batch(news: list[dict], prices: dict, idx: dict, batch: list[str]) -> list[dict]:
+    """LLM-анализ одного батча тикеров. При пропуске тикеров — один ретрай."""
+    allowed = set(batch)
+    user = build_user_prompt(news, prices, idx, batch)
+    answer = llm.chat_json(
+        [{"role": "system", "content": SYSTEM_PROMPT},
+         {"role": "user", "content": user}],
+        max_tokens=CONFIG["llm"]["max_tokens"],
+        temperature=CONFIG["llm"]["temperature"],
+    )
+    signals = _validate(answer.get("signals", []), allowed)
+    if len(signals) < len(allowed):  # модель пропустила тикеры — один ретрай
+        missing = allowed - {s["ticker"] for s in signals}
+        fix = llm.chat_json(
+            [{"role": "system", "content": SYSTEM_PROMPT},
+             {"role": "user", "content": user +
+              f"\n\nТы пропустил тикеры: {', '.join(sorted(missing))}. Дай сигналы ТОЛЬКО по ним."}],
+            max_tokens=2500, temperature=0.1)
+        signals += _validate(fix.get("signals", []), missing)
+    return signals
 
-    Анализ — по ПУЛУ ВНИМАНИЯ (db.get_pool), не по всему watchlist.
+
+def run_analysis(kind: str) -> list[dict]:
+    """Собрать контекст, вызвать LLM батчами по ВСЕМУ watchlist, сохранить сигналы.
+
+    Каждый сигнал несёт price_at_signal и signal_ts — для честного бэктеста
+    даже после рестартов (эфемерные котировки SQLite обнуляются при деплое).
     """
     prices = db.latest_prices() or {}
     idx = fetch_quotes.fetch_index()
     news = db.recent_news(hours=CONFIG["llm"]["news_hours"])
-    allowed = set(db.get_pool())
+    tickers = fetch_quotes.tickers()
+    batch_size = max(1, int(CONFIG["llm"].get("batch_size", 8)))
 
     signals: list[dict] = []
-    try:
-        user = build_user_prompt(news, prices, idx)
-        answer = llm.chat_json(
-            [{"role": "system", "content": SYSTEM_PROMPT},
-             {"role": "user", "content": user}],
-            max_tokens=CONFIG["llm"]["max_tokens"],
-            temperature=CONFIG["llm"]["temperature"],
-        )
-        signals = _validate(answer.get("signals", []), allowed)
-        if len(signals) < len(allowed):  # модель пропустила тикеры — один ретрай
-            missing = allowed - {s["ticker"] for s in signals}
-            fix = llm.chat_json(
-                [{"role": "system", "content": SYSTEM_PROMPT},
-                 {"role": "user", "content": user +
-                  f"\n\nТы пропустил тикеры: {', '.join(missing)}. Дай сигналы ТОЛЬКО по ним."}],
-                max_tokens=2000, temperature=0.1)
-            signals += _validate(fix.get("signals", []), allowed)
-        log.info("LLM: %d сигналов", len(signals))
-    except Exception as e:
-        log.error("LLM-анализ не удался: %s — fallback на технические сигналы", e)
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i:i + batch_size]
+        part: list[dict] = []
+        try:
+            part = _analyze_batch(news, prices, idx, batch)
+            log.info("LLM батч %d-%d: %d сигналов", i + 1, i + len(batch), len(part))
+        except Exception as e:
+            log.error("LLM батч %s не удался: %s — fallback на технику", batch, e)
+        if len(part) < len(batch):  # недостающие тикеры закрываем техническим fallback
+            have = {s["ticker"] for s in part}
+            part += [s for s in _fallback_signals(prices, batch) if s["ticker"] not in have]
+        signals += part
 
-    if not signals:
-        signals = _fallback_signals(prices)
+    # Фиксируем цену и время сигнала в payload — бэктест не зависит от кеша котировок.
+    ts = db.now_iso()
+    for s in signals:
+        p = prices.get(s["ticker"]) or {}
+        s["price_at_signal"] = p.get("last")
+        s["signal_ts"] = ts
 
     db.save_signal(kind, signals)
     try:  # дублируем в постоянное хранилище для бэктеста (переживает рестарты)

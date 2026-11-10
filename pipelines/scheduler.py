@@ -131,6 +131,9 @@ def scheduled_report(kind: str):
         q = deliver.quality_summary()
         if q:
             deliver.send_text(q)
+        ps = deliver.paper_summary()
+        if ps:
+            deliver.send_text(ps)
     log.info("отчёт %s отправлен (%d сигналов)", kind, len(signals))
 
 
@@ -238,8 +241,43 @@ def intraday_summary():
 
 
 
+def _price_age_min(ts: str | None) -> float:
+    """Возраст котировки в минутах. Поддерживает и 'YYYY-MM-DD HH:MM:SS', и ISO."""
+    if not ts:
+        return 1e9
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            dt = datetime.strptime(str(ts), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return 1e9
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 60
+
+
+def _trading_days_since(created_at) -> int:
+    """Сколько БУДНИХ дней прошло после входа (грубая оценка торговых дней)."""
+    try:
+        dt = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return 0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    start = dt.astimezone(MSK_TZ).date()
+    today = now_local().astimezone(MSK_TZ).date()
+    d = start + timedelta(days=1)
+    n = 0
+    while d <= today:
+        if d.weekday() < 5:
+            n += 1
+        d += timedelta(days=1)
+    return n
+
+
 def check_positions():
-    """Мониторинг активных позиций: алерт при достижении цели или пробое стопа."""
+    """Мониторинг активных позиций: цель/стоп/время. Цены обновляем ПЕРЕД проверкой."""
     from . import store
     try:
         positions = store.active_positions()
@@ -248,17 +286,24 @@ def check_positions():
         return
     if not positions:
         return
+    # Свежий срез перед стопами/целями: снапшот раз в 10 мин мог устареть.
+    try:
+        fetch_quotes.fetch_snapshot()
+    except Exception as e:
+        log.warning("positions price refresh: %s", e)
     try:
         prices = db.latest_prices() or {}
-        if not prices:
-            fetch_quotes.fetch_snapshot()
-            prices = db.latest_prices() or {}
     except Exception:
         prices = {}
+    exit_days = int(CONFIG.get("intraday", {}).get("paper_exit_days", 4))
     for p in positions:
         ticker = p["ticker"]
         q = prices.get(ticker)
         if not q or not q.get("last"):
+            continue
+        # Не закрываем по сильно устаревшей цене, если свежий срез не удался.
+        if _price_age_min(q.get("ts")) > 5:
+            log.warning("positions %s: котировка устарела (%s) — пропуск", ticker, q.get("ts"))
             continue
         last = float(q["last"])
         stop = float(p["stop"])
@@ -280,15 +325,26 @@ def check_positions():
                     f"🎯 <b>ЦЕЛЬ достигнута</b> — {ticker}\n"
                     f"Цена {last:g} ≥ цель {target:g} ₽. Фиксируйте прибыль.")
                 store.close_position(p["id"], "target_hit")
+        elif mode == "paper" and _trading_days_since(p.get("created_at")) >= exit_days:
+            _paper_close(p, last, "time")
 
 
 def _paper_close(p: dict, exit_price: float, reason: str):
-    """Закрыть бумажную позицию и записать результат в трекер (trades)."""
+    """Атомарно закрыть бумажную позицию и записать сделку с причиной выхода."""
     from . import store
-    store.close_position(p["id"], reason + "_hit")
-    tid = store.add_trade(p["ticker"], float(p["entry_price"]),
-                          note=f"paper:{reason}", mode="paper")
-    r = store.close_trade(tid, exit_price)
+    try:
+        r = store.record_paper_exit(p, exit_price, reason)
+    except Exception as e:
+        log.warning("paper close %s: %s", p.get("ticker"), e)
+        return
+    if not r:
+        log.warning("paper close %s: сделка не записана", p.get("ticker"))
+        return
+    if reason == "stop":
+        try:
+            store.set_meta(f"paper_cooldown_{p['ticker']}", datetime.now(timezone.utc).isoformat())
+        except Exception as e:
+            log.warning("paper cooldown %s: %s", p.get("ticker"), e)
     emoji = "🟢" if (r and r["pnl_pct"] > 0) else "🔴"
     deliver.send_text(
         f"{emoji} <b>Бумажная сделка закрыта</b> — {p['ticker']} ({reason})\n"
@@ -297,31 +353,78 @@ def _paper_close(p: dict, exit_price: float, reason: str):
 
 
 def paper_trading():
-    """Бумажная торговля: авто-вход по вердиктам всего watchlist.
-
-    Ранжирует весь watchlist (34 бумаги) по баллу сетапа и открывает
-    бумажные позиции по топ-5 (кроме "avoid"), чтобы статистика набиралась
-    быстро на всех ликвидных бумагах. Выход — в check_positions().
-    """
+    """Бумажная торговля: вход ТОЛЬКО по вердикту 'enter', с лимитом и кулдауном."""
     from . import intraday, store
-    if not CONFIG.get("intraday", {}).get("paper_trading", False):
+    cfg = CONFIG.get("intraday", {})
+    if not cfg.get("paper_trading", False):
         return
     try:
-        open_pos = {p["ticker"] for p in store.active_positions(mode="paper")}
-        top_n = int(CONFIG.get("intraday", {}).get("paper_top_n", 5))
-        # весь watchlist, ранжированный по баллу (кеш свечей, без спама MOEX)
+        active = store.active_positions(mode="paper")
+        open_pos = {p["ticker"] for p in active}
+        top_n = int(cfg.get("paper_top_n", 5))
+        max_open = int(cfg.get("paper_max_open", top_n))
+        if len(active) >= max_open:
+            return
         scored = intraday.rank_paper(fetch_quotes.tickers(), top_n=top_n)
     except Exception as e:
         log.warning("paper screener: %s", e)
         return
+
+    # Логируем кандидатов с ценой/вердиктом — для честной статистики enter vs wait.
+    # Дедуп: не чаще одного раза в день на тикер+вердикт (иначе лог раздувается
+    # одинаковыми записями каждые 10 минут и искажает бэктест).
+    try:
+        if not store.get_meta("paper_experiment_start"):
+            store.set_meta("paper_experiment_start", datetime.now(timezone.utc).isoformat())
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        payloads, markers = [], []
+        for row in scored:
+            v = row["verdict"]
+            key = f"papersig_{row['ticker']}"
+            marker = f"{today}:{v['call']}"
+            try:
+                if store.get_meta(key, "") == marker:
+                    continue
+            except Exception:
+                pass
+            payloads.append({
+                "ticker": row["ticker"],
+                "direction": "long" if v["call"] == "enter" else "flat",
+                "confidence": "medium" if v["call"] == "enter" else "low",
+                "call": v["call"], "score": v["score"],
+                "price_at_signal": v["entry"], "stop": v["stop"], "target": v["target"],
+                "confirmations": v.get("confirmations", []),
+                "fee_pct": v.get("fee_pct"), "signal_ts": db.now_iso(),
+            })
+            markers.append((key, marker))
+        if payloads:
+            store.log_signal("paper", payloads)
+            for key, marker in markers:
+                store.set_meta(key, marker)
+    except Exception as e:
+        log.warning("paper signal log: %s", e)
+
     entered = 0
+    cooldown_hours = float(cfg.get("paper_cooldown_hours", 24))
     for row in scored:
+        if len(active) + entered >= max_open:
+            break
         t = row["ticker"]
         v = row["verdict"]
         if t in open_pos:
             continue
-        if v["call"] == "avoid":
-            continue  # явно не входить
+        if v["call"] != "enter":
+            continue  # wait/avoid — не входим, статистика enter отдельно
+        try:
+            cd = store.get_meta(f"paper_cooldown_{t}", "")
+            if cd:
+                cd_dt = datetime.fromisoformat(cd.replace("Z", "+00:00"))
+                if cd_dt.tzinfo is None:
+                    cd_dt = cd_dt.replace(tzinfo=timezone.utc)
+                if (datetime.now(timezone.utc) - cd_dt).total_seconds() < cooldown_hours * 3600:
+                    continue
+        except Exception:
+            pass
         try:
             store.open_position(t, float(v["entry"]), float(v["stop"]),
                                 float(v["target"]), mode="paper")
@@ -334,7 +437,7 @@ def paper_trading():
         except Exception as e:
             log.warning("paper open %s: %s", t, e)
     if entered:
-        log.info("paper: открыто %d позиций из топ-%d", entered, top_n)
+        log.info("paper: открыто %d позиций (лимит %d)", entered, max_open)
 
 
 def healthcheck_ping(ok: bool = True):

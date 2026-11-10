@@ -5,9 +5,13 @@
 """
 from __future__ import annotations
 
+import logging
+
 from . import db
 from .http import get_json
 from .settings import CONFIG
+
+log = logging.getLogger("intraday")
 
 SEC_BASE = ("https://iss.moex.com/iss/engines/stock/markets/shares"
             "/boards/TQBR/securities")
@@ -17,10 +21,15 @@ def _cfg(key, default):
     return (CONFIG.get("intraday") or {}).get(key, default)
 
 
-def fetch_bars(secid: str, interval: int | None = None, days: int = 3) -> list[dict]:
-    """10-минутные свечи (новые в конце)."""
+def fetch_bars(secid: str, interval: int | None = None, days: int | None = None) -> list[dict]:
+    """10-минутные свечи (новые в конце).
+
+    days по умолчанию берём с запасом (5 календарных), чтобы compute_levels
+    видел 3 полных прошлых дня даже после выходных/понедельника.
+    """
     from datetime import date, timedelta
     interval = interval or int(_cfg("interval", 10))
+    days = int(days if days is not None else _cfg("history_days", 5))
     frm = (date.today() - timedelta(days=days)).isoformat()
     d = get_json(f"{SEC_BASE}/{secid}/candles.json", {
         "iss.meta": "off", "interval": interval, "from": frm,
@@ -256,6 +265,7 @@ def detect_events(secid: str, ind: dict) -> list[dict]:
     move = m15 if abs(m15) >= abs(m30) / 2 else m30
     pr = ind["pulse_ratio"] or 0
     vol_ratio = ind["vol_ratio"] or 0
+    tb = ind.get("_tb") or []
 
     # 1. Резкий скачок ценой + объёмом (смарт-мани импульс)
     if abs(move) >= spike_pct and pr >= vol_mult:
@@ -265,13 +275,17 @@ def detect_events(secid: str, ind: dict) -> list[dict]:
             "power": abs(move) * pr,
         })
 
-    # 2. Пробой диапазона дня с объёмом
-    if ind["range_pos"] is not None and ind["range_pos"] >= 99 and pr >= 1.5:
-        events.append({"type": "BREAK_HIGH", "move": ind["chg_day"], "vol": pr,
-                       "power": (ind["move_15m"] or 0) * pr})
-    if ind["range_pos"] is not None and ind["range_pos"] <= 1 and pr >= 1.5:
-        events.append({"type": "BREAK_LOW", "move": ind["chg_day"], "vol": pr,
-                       "power": abs(ind["move_15m"] or 0) * pr})
+    # 2. Пробой ЭКСТРЕМУМА предыдущих баров дня (не просто касание хая/лоу,
+    #    который сам входит в дневной диапазон). Нужно закрытие за уровнем + объём.
+    if len(tb) >= 2 and pr >= 1.5:
+        prev_hi = max(b["high"] for b in tb[:-1])
+        prev_lo = min(b["low"] for b in tb[:-1])
+        if ind["last"] > prev_hi:
+            events.append({"type": "BREAK_HIGH", "move": ind["chg_day"], "vol": pr,
+                           "power": (ind["move_15m"] or 0) * pr})
+        if ind["last"] < prev_lo:
+            events.append({"type": "BREAK_LOW", "move": ind["chg_day"], "vol": pr,
+                           "power": abs(ind["move_15m"] or 0) * pr})
 
     # 3. Экстремум RSI на интрадее — откат/отскок
     if ind["rsi14"] is not None:
@@ -345,22 +359,25 @@ def detect_events(secid: str, ind: dict) -> list[dict]:
             events.append({"type": "ABSORPTION", "move": m15,
                            "vol": round(last5_vol / avg_vol, 1),
                            "power": vol_mult * 3})
-        # VOL_NODE: 2 бара подряд закрылись за пределами POC-зоны с объёмом x2+
+        # VOL_NODE: 2 бара подряд закрылись за пределами POC-зоны с объёмом x2+.
+        # ВАЖНО: направление пробоя. Пробой ВНИЗ не должен помогать лонгу.
         if len(tb) >= 2 and avg_vol:
             b1, b2 = tb[-2], tb[-1]
-            out1 = b1["close"] < poc_lo or b1["close"] > poc_hi
-            out2 = b2["close"] < poc_lo or b2["close"] > poc_hi
+            above1, below1 = b1["close"] > poc_hi, b1["close"] < poc_lo
+            above2, below2 = b2["close"] > poc_hi, b2["close"] < poc_lo
+            inside2 = not above2 and not below2
             big1 = b1["volume"] >= 2 * avg_vol
             big2 = b2["volume"] >= 2 * avg_vol
-            detail = ""
-            if out1 and out2 and big1 and big2:
-                # чистое удержание за узлом
-                detail = ""
-            elif out1 and big1 and not out2 and big2:
-                # пробили узел, но закрылись обратно внутрь — ложный пробой
-                detail = "false_breakout"
-            else:
-                detail = None
+            detail = None
+            if big1 and big2:
+                if above1 and above2:
+                    detail = "up"                 # удержание над узлом — за лонг
+                elif below1 and below2:
+                    detail = "down"               # удержание под узлом — против лонга
+                elif above1 and inside2:
+                    detail = "false_breakout_up"  # не смогли удержать верх — слабо
+                elif below1 and inside2:
+                    detail = "false_breakout_down"  # возврат из-под узла — осторожно
             if detail is not None:
                 events.append({"type": "VOL_NODE", "move": m15,
                                "vol": round(max(b1["volume"], b2["volume"]) / avg_vol, 1),
@@ -373,13 +390,16 @@ def detect_events(secid: str, ind: dict) -> list[dict]:
         sup = levels.get("nearest_support")
         res = levels.get("nearest_resistance")
         test_level = None
+        level_side = None
         if sup is not None and b["low"] < sup <= b["close"]:
             test_level = sup
+            level_side = "support"      # отскок от поддержки — за лонг
         elif res is not None and b["high"] > res >= b["close"]:
             test_level = res
+            level_side = "resistance"   # отказ от сопротивления — против лонга
         if test_level is not None and b["volume"] >= 1.5 * avg_vol:
             events.append({"type": "LEVEL_TEST", "move": m15,
-                           "level": round(test_level, 4),
+                           "level": round(test_level, 4), "level_side": level_side,
                            "vol": round(b["volume"] / avg_vol, 1),
                            "power": vol_mult * 1.5})
 
@@ -394,11 +414,11 @@ RUS = {
     "BREAK_LOW": "💧 ПРОБОЙ МИНИМУМА ДНЯ",
     "RSI_LOW": "🩸 ПЕРЕПРОДАННОСТЬ (интрадей RSI)",
     "RSI_HIGH": "♨️ ПЕРЕКУПЛЕННОСТЬ (интрадей RSI)",
-    "ABSORPTION": "🐘 ОБЪЁМ БЕЗ ДВИЖЕНИЯ (похоже на набор позиции)",
+    "ABSORPTION": "🐘 ОБЪЁМ БЕЗ ДВИЖЕНИЯ (набор или раздача — направление неясно)",
     "SPRING": "🌱 СМЫВ ПРОДАВЦОВ (SPRING) — вероятный разворот вверх",
     "UPTHRUST": "🌊 СМЫВ ПОКУПАТЕЛЕЙ (UPTHRUST) — вероятный разворот вниз",
-    "DELTA_DIV_POS": "🫥 СКРЫТАЯ ПОКУПКА (цена вниз, дельта растёт)",
-    "DELTA_DIV_NEG": "🫥 СКРЫТАЯ ПРОДАЖА (цена вверх, дельта падает)",
+    "DELTA_DIV_POS": "🫥 ВОЗМОЖНАЯ ПОКУПКА (эвристика по закрытиям свечей)",
+    "DELTA_DIV_NEG": "🫥 ВОЗМОЖНАЯ ПРОДАЖА (эвристика по закрытиям свечей)",
     "VOL_NODE": "📦 ПРОБОЙ ОБЪЁМНОГО УЗЛА (POC)",
     "LEVEL_TEST": "🧱 ТЕСТ УРОВНЯ С ПОГЛОЩЕНИЕМ",
 }
@@ -450,25 +470,31 @@ def _idea(secid: str, ev: dict, ind: dict) -> str:
                 f"смыв покупателей, возможен разворот вниз. Спот: не догонять, "
                 f"фиксировать лонг / ждать откат к VWAP {format(vwap, '.4g') if vwap else '—'}₽.")
     if ev["type"] == "DELTA_DIV_POS":
-        return (f"цена обновила лоу дня, но дельта объёма растёт (средняя {ind.get('delta_ratio_3')}) — "
-                f"скрытая покупка крупным игроком. Спот: интерес к набору от {lo:.4g}₽, "
+        return (f"цена обновила лоу дня, закрытия в верхней части свечей (эвристика {ind.get('delta_ratio_3')}) — "
+                f"возможная покупка, но нужно подтверждение. Спот: интерес к набору от {lo:.4g}₽, "
                 f"стоп под {stop_s}.")
     if ev["type"] == "DELTA_DIV_NEG":
         res = levels.get("nearest_resistance")
         res_s = f"{res:.4g}₽" if res is not None else f"{hi:.4g}₽"
-        return (f"цена обновила хай дня, но дельта объёма падает — скрытая продажа. "
-                f"Спот: не покупать на хае, ждать подтверждения разворота, "
+        return (f"цена обновила хай дня, закрытия в нижней части свечей (эвристика) — "
+                f"возможная продажа. Спот: не покупать на хае, ждать подтверждения разворота, "
                 f"сопротивление у {res_s}.")
     if ev["type"] == "VOL_NODE":
-        if ev.get("detail") == "false_breakout":
-            return (f"пробой объёмного узла (POC) с объёмом x{ev.get('vol', 0)}, но цена "
-                    f"вернулась под узел — ложный пробой. Спот: не входить против узла, "
-                    f"ждать повторного удержания над POC.")
-        return (f"два бара подряд закрылись за пределами POC-зоны на объёме x{ev.get('vol', 0)} — "
-                f"пробой объёмного узла. Спот: удержание за узлом — импульс в сторону пробоя, "
+        detail = ev.get("detail")
+        if detail == "down":
+            return (f"два бара закрылись ПОД объёмным узлом (POC) на объёме x{ev.get('vol', 0)} — "
+                    f"давление продаж. Спот: не покупать против пробоя вниз, ждать возврата над POC.")
+        if detail in ("false_breakout_up", "false_breakout_down"):
+            return (f"пробой объёмного узла (POC) на объёме x{ev.get('vol', 0)}, но цена "
+                    f"вернулась в узел — ложный пробой. Спот: ждать повторного удержания за узлом.")
+        return (f"два бара подряд закрылись НАД объёмным узлом на объёме x{ev.get('vol', 0)} — "
+                f"пробой вверх. Спот: удержание над POC — импульс вверх, "
                 f"стоп под {stop_s}.")
     if ev["type"] == "LEVEL_TEST":
-        return (f"тень за уровень {ev.get('level')} с возвратом close обратно и объёмом — "
+        if ev.get("level_side") == "resistance":
+            return (f"тень за сопротивление {ev.get('level')} с возвратом close обратно и объёмом — "
+                    f"отказ от уровня. Спот: покупки здесь опасны, ждать пробоя с закреплением.")
+        return (f"тень за поддержку {ev.get('level')} с возвратом close обратно и объёмом — "
                 f"тест уровня с поглощением. Спот: удержание уровня — отскок; пробой с "
                 f"закреплением — импульс.")
     return "наблюдаем."
@@ -615,9 +641,8 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None,
             score += 0.5
             reasons.append(f"цена в верхней половине дня ({rng_pos}%) (+0.5)")
 
-    # 5. События смарт-мани
+    # 5. События смарт-мани (только направленные; беснаправленный объём — не плюс)
     events = detect_events(secid, ind)
-    pos_ev = {"SPRING", "DELTA_DIV_POS", "LEVEL_TEST", "ABSORPTION"}
     neg_ev = {"UPTHRUST", "DELTA_DIV_NEG", "SPIKE_DOWN", "BREAK_LOW"}
     for e in events:
         t = e["type"]
@@ -627,27 +652,41 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None,
             confirmations.add("event")
         elif t == "DELTA_DIV_POS":
             score += 1.0
-            reasons.append("скрытая покупка (дельта растёт) (+1)")
+            reasons.append("возможная покупка (эвристика по закрытиям свечей) (+1)")
             confirmations.add("event")
-        elif t in ("BREAK_HIGH",) and rng_pos is not None and rng_pos >= 99:
+        elif t == "BREAK_HIGH":
             score += 1.0
-            reasons.append("пробой максимума дня (+1)")
+            reasons.append("пробой максимума предыдущих баров дня (+1)")
             confirmations.add("event")
         elif t == "VOL_NODE":
-            if e.get("detail") == "false_breakout":
-                score -= 1.0
-                reasons.append("ложный пробой POC (−1)")
-            else:
+            detail = e.get("detail")
+            if detail == "up":
                 score += 1.0
-                reasons.append("пробой объёмного узла (+1)")
+                reasons.append("пробой объёмного узла ВВЕРХ (+1)")
                 confirmations.add("event")
+            elif detail == "down":
+                score -= 1.0
+                reasons.append("пробой объёмного узла ВНИЗ — против лонга (−1)")
+            elif detail == "false_breakout_up":
+                score -= 0.5
+                reasons.append("ложный пробой POC вверх (−0.5)")
+            else:
+                reasons.append("возврат в POC после пробоя вниз — направление неясно (0)")
+        elif t == "LEVEL_TEST":
+            if e.get("level_side") == "support":
+                score += 0.5
+                reasons.append("отскок от поддержки (+0.5)")
+                confirmations.add("event")
+            elif e.get("level_side") == "resistance":
+                score -= 0.5
+                reasons.append("отказ от сопротивления — против лонга (−0.5)")
+            else:
+                reasons.append("тест уровня — направление неясно (0)")
+        elif t == "ABSORPTION":
+            reasons.append("объём без движения — набор или раздача, не подтверждение (0)")
         elif t in neg_ev:
             score -= 1.0
             reasons.append(f"{RUS.get(t, t)} — против лонга (−1)")
-        elif t in pos_ev:
-            score += 0.5
-            reasons.append(f"{RUS.get(t, t)} (+0.5)")
-            confirmations.add("event")
 
     # 6. Участие объёма
     vol = ind.get("vol_ratio")
@@ -779,6 +818,11 @@ def screener(tickers: list[str], top_n: int = 3) -> list[dict]:
     except Exception:
         pass
     scored = []
+    news = None
+    try:
+        news = db.recent_news(hours=48, limit=40)
+    except Exception:
+        pass
     for t in tickers:
         try:
             daily_ind = None
@@ -791,7 +835,7 @@ def screener(tickers: list[str], top_n: int = 3) -> list[dict]:
             ind = analyze_bars(bars)
             if not ind:
                 continue
-            v = verdict(t, ind, daily_ind, idx=idx)
+            v = verdict(t, ind, daily_ind, idx=idx, news=news)
             scored.append({
                 "ticker": t,
                 "verdict": v,
@@ -827,6 +871,10 @@ def rank_paper(tickers: list[str], top_n: int = 5) -> list[dict]:
             daily_ind = None
             try:
                 daily_ind = indicators.compute(db.get_candles(t, limit=80))
+                if daily_ind is None:
+                    # после деплоя кеш свечей пуст — догружаем, иначе теряем тренд/ATR
+                    fetch_quotes.fetch_candles(t, days=90)
+                    daily_ind = indicators.compute(db.get_candles(t, limit=80))
             except Exception:
                 pass
             bars = fetch_bars(t)

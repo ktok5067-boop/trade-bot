@@ -162,33 +162,93 @@ def send_alert(news: dict, comment: str = ""):
 
 
 def quality_summary() -> str:
-    """Hit-rate: сигналы 4+ часов назад против фактического движения цены."""
-    from . import analyze
+    """Качество сигналов: только старше 4 часов, с учётом издержек.
+
+    Цена входа берётся из payload (price_at_signal) — работает и после деплоя,
+    когда эфемерный кеш котировок пуст.
+    """
+    from datetime import datetime, timezone
+    from .settings import CONFIG
+    fee = float((CONFIG.get("intraday") or {}).get("fee_pct", 1.0))
     rows = [s for s in db.signals_since(hours=24) if s["kind"] in ("brief", "evening")]
-    checked, hit = 0, 0
+    checked, hit, in_plus = 0, 0, 0
+    total_net = 0.0
     lines = []
+    now_utc = datetime.now(timezone.utc)
     for row in rows:
+        try:
+            created = datetime.fromisoformat(str(row["created_at"]).replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            continue
+        if (now_utc - created).total_seconds() < 4 * 3600:
+            continue  # сигналу меньше 4 часов — судить рано
         for s in row["payload"]:
-            if s["direction"] not in ("long", "short"):
+            if s.get("direction") not in ("long", "short"):
                 continue
-            created = row["created_at"]
-            price_then = db.price_at(s["ticker"], created)
-            price_now = (db.quote_stats(s["ticker"]) or {}).get("last") or \
-                db.latest_prices().get(s["ticker"], {}).get("last")
+            price_then = s.get("price_at_signal") or db.price_at(s["ticker"], row["created_at"])
+            price_now = db.latest_prices().get(s["ticker"], {}).get("last") or \
+                (db.quote_stats(s["ticker"]) or {}).get("last")
             if not price_then or not price_now:
                 continue
-            chg = price_now / price_then - 1
-            ok = (s["direction"] == "long" and chg > 0) or \
-                 (s["direction"] == "short" and chg < 0)
+            chg = (price_now / price_then - 1) * 100
+            net = chg - fee if s["direction"] == "long" else -chg - fee
+            ok = chg > 0 if s["direction"] == "long" else chg < 0
             checked += 1
             hit += ok
+            in_plus += net > 0
+            total_net += net
             if len(lines) < 10:
-                lines.append(f"{s['ticker']} {s['direction']}: {chg:+.2%} — {'✅' if ok else '❌'}")
+                lines.append(f"{s['ticker']} {s['direction']}: {chg:+.2f}% "
+                             f"(после издержек {net:+.2f}%) — {'✅' if ok else '❌'}")
     if not checked:
         return ""
     rate = hit / checked * 100
-    return (f"\n\n📊 <b>Качество сигналов (24ч):</b> {hit}/{checked} верно ({rate:.0f}%)\n"
+    return (f"\n\n📊 <b>Качество сигналов (24ч, старше 4ч):</b> {hit}/{checked} верно ({rate:.0f}%)\n"
+            f"После издержек {fee}% в плюсе: {in_plus}/{checked} · суммарно {total_net:+.2f}%\n"
             + "\n".join(_escape(l) for l in lines))
+
+
+def paper_summary() -> str:
+    """Сводка бумажного эксперимента: для вечернего отчёта и команды /paper."""
+    from datetime import datetime, timezone
+    from . import store
+    try:
+        stats = store.trade_stats(365, mode="paper")
+        pos = store.active_positions(mode="paper")
+        start = store.get_meta("paper_experiment_start", "")
+    except Exception as e:
+        log.warning("paper_summary: %s", e)
+        return ""
+    days = 0
+    start_line = ""
+    if start:
+        try:
+            dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            days = (datetime.now(timezone.utc) - dt).days
+            start_line = f"Старт: {dt.strftime('%d.%m.%Y')} · дней в эксперименте: {days}\n"
+        except ValueError:
+            pass
+    wr = f"{stats['win_rate']}%" if stats["win_rate"] is not None else "—"
+    avg = f"{stats['avg_pnl_pct']:+.2f}%" if stats["avg_pnl_pct"] is not None else "—"
+    open_lines = "\n".join(
+        f"• {p['ticker']}: вход {float(p['entry_price']):g} · стоп {float(p['stop']):g} · "
+        f"цель {float(p['target']):g}" for p in pos) or "• открытых нет"
+    note = ""
+    if stats["closed"] < 30:
+        note = ("\n<i>Сделок пока мало — винрейт без большой выборки не показатель, "
+                "наблюдаем дальше.</i>")
+    return (f"🧪 <b>Бумажная торговля</b> (вход только по вердикту «enter», "
+            f"выход: цель/стоп/время ~4 торговых дня)\n"
+            f"{start_line}\n"
+            f"Открыто сейчас ({len(pos)}):\n{open_lines}\n\n"
+            f"Закрыто: {stats['closed']} · в плюс: {stats['wins']} · в минус: {stats['losses']}\n"
+            f"Винрейт: {wr} · средняя сделка: {avg}\n"
+            f"Итог (с издержками ~{stats['avg_fee_pct'] or 0}%): <b>{stats['total_pnl_pct']:+.2f}%</b> · "
+            f"макс. просадка: {stats['max_drawdown_pct']:.2f}%{note}")
 
 
 def send_voice_ogg(ogg_bytes: bytes, chat_id: str | int):

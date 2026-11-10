@@ -80,7 +80,7 @@ watchlist:
   - ticker: ALRS
     name: АЛРОСА
     keywords: ["алроса"]
-  - ticker: FIVE
+  - ticker: X5
     name: X5 Group
     keywords: ["x5", "пятёрочка", "пятерочка"]
   - ticker: OZON
@@ -91,16 +91,13 @@ watchlist:
     keywords: ["мкб", "московский кредитный"]
   - ticker: AFKS
     name: АФК Система
-    keywords: ["афк система", "система"]
+    keywords: ["афк система", "афк"]
   - ticker: HYDR
     name: РусГидро
-    keywords: ["русгидро", "гидро"]
+    keywords: ["русгидро"]
   - ticker: FEES
     name: Россети
     keywords: ["россети", "фск"]
-  - ticker: POLY
-    name: Полиметалл
-    keywords: ["полиметалл"]
   - ticker: PIKK
     name: ПИК
     keywords: ["пик", "пкв"]
@@ -154,6 +151,7 @@ llm:
   temperature: 0.2
   news_hours: 48               # глубина новостей для анализа
   max_news_per_ticker: 6       # сколько новостей на тикер в промпт
+  batch_size: 8                # тикеров на один LLM-запрос (весь watchlist батчами)
 
 # Интрадей-сканер волатильности (10-минутные свечи, пул внимания)
 intraday:
@@ -171,4 +169,9 @@ intraday:
   paper_trading: true          # бумажная торговля: бот сам входит/выходит и ведёт статистику
   paper_interval_min: 10       # как часто бот ищет новые бумажные входы, минут
   paper_top_n: 5               # во сколько лучших бумаг по баллу входить (весь watchlist)
+  paper_max_open: 5            # максимум одновременно открытых бумажных позиций
+  paper_exit_days: 4           # выход по времени: ~4 торговых дня без цели/стопа
+  paper_cooldown_hours: 24     # пауза повторного входа после стопа, часов
   poscheck_interval_min: 2     # как часто проверяет цель/стоп открытых позиций, минут
+  history_days: 5              # календарных дней 10-мин свечей (запас на выходные)
+  min_confirmations: 2         # минимум независимых подтверждений для вердикта enter

@@ -47,11 +47,22 @@ def score_impact(text: str) -> int:
 
 
 def match_tickers(text: str) -> list[str]:
+    """Привязка новости к тикерам по ключевым словам.
+
+    Короткие слова (<= 4 символов: 'пик', 'озон', 'мтс'…) ищем по границам слова,
+    чтобы 'пик' не ловил 'пиковый', а 'озон' — 'озоновый слой'.
+    Длинные основы ('мосбирж', 'т-технологи') — как раньше, подстрокой.
+    """
     t = text.lower()
     out = []
     for w in CONFIG["watchlist"]:
         for kw in w.get("keywords", []):
-            if kw.lower() in t:
+            k = kw.lower()
+            if len(k) <= 4:
+                hit = re.search(r"(?<!\w)" + re.escape(k) + r"(?!\w)", t) is not None
+            else:
+                hit = k in t
+            if hit:
                 out.append(w["ticker"])
                 break
     return out

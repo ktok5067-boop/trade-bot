@@ -54,8 +54,16 @@ def minutes_since_meta(key: str, default: float = 1e9) -> float:
 
 
 def get_pool() -> list[str]:
-    """Пул внимания для интрадей-сканера (по умолчанию SPBE)."""
-    raw = get_meta("focus_pool")
+    """Пул внимания. Основное хранение — постоянное (store.meta_persist),
+    локальная meta — запасной вариант, чтобы пул не сбрасывался при деплое."""
+    raw = ""
+    try:
+        from . import store
+        raw = store.get_meta("focus_pool", "")
+    except Exception:
+        raw = ""
+    if not raw:
+        raw = get_meta("focus_pool")
     if not raw:
         return ["SPBE"]
     try:
@@ -67,6 +75,11 @@ def get_pool() -> list[str]:
 
 def set_pool(pool: list[str]):
     set_meta("focus_pool", json.dumps(pool))
+    try:
+        from . import store
+        store.set_meta("focus_pool", json.dumps(pool))
+    except Exception:
+        pass
 
 
 def init_db():
@@ -158,12 +171,24 @@ def quote_stats(secid: str) -> dict | None:
     return {"last": last, "chg_1d": chg_1d, "chg_5d": chg_5d, "volume": vol_note}
 
 
+def _norm_ts(ts: str) -> str:
+    """Приводим ISO/SQLite время к единому UTC-формату prices.ts."""
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return str(ts)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def price_at(secid: str, ts: str) -> float | None:
     """Ближайшая зафиксированная цена ПОСЛЕ момента ts (для проверки сигналов)."""
+    norm = _norm_ts(ts)
     with conn() as c:
         row = c.execute(
             "SELECT last FROM prices WHERE secid=? AND ts>=? ORDER BY ts LIMIT 1",
-            (secid, ts)).fetchone()
+            (secid, norm)).fetchone()
         return row["last"] if row else None
 
 

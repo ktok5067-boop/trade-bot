@@ -19,10 +19,10 @@ HELP = """Команды:
 /top — что лучше взять на интрадей (3-4 дня)
 /pool — пул внимания · /pool add SBER · /pool del SBER
 /quote SBER — котировка (по-русски тоже: /quote спб биржа)
-/trade SPBE 178.3 — открыть сделку (записывает в трекер)
+/trade SPBE 178.3 175 185 — ваша сделка: цена, стоп, цель (записывает и следит)
 /close 1 182 — закрыть сделку №1 по цене 182 (посчитает P&L)
 /stats — ваша статистика сделок (винрейт, итог)
-/paper — бумажная торговля: бот сам входит/выходит и ведёт статистику
+/paper — бумажный эксперимент: входы/выходы бота и статистика
 /backtest — качество прошлых сигналов с учётом комиссии
 /signals — последние сигналы
 /brief — анализ сейчас · /status — состояние бота
@@ -58,7 +58,8 @@ def _button_to_command(text: str) -> str | None:
 
 
 def _authorized(chat_id: int) -> bool:
-    return not _ALLOWED_IDS or chat_id in _ALLOWED_IDS
+    # Пустой список НЕ означает «пускаем всех» — бот отвечает только владельцу.
+    return bool(_ALLOWED_IDS) and chat_id in _ALLOWED_IDS
 
 
 def _stem(s: str) -> str:
@@ -393,18 +394,49 @@ def handle_update(msg: dict):
     elif text.startswith("/trade"):
         from . import store
         parts = text.split()
-        # /trade SPBE 178.3
+        # /trade SPBE 178.3 [стоп 175 цель 185]
         if len(parts) < 3:
-            deliver.send_text("Формат: /trade SPBE 178.3", chat_id)
+            deliver.send_text("Формат: /trade SPBE 178.3 175 185\n"
+                              "(тикер, цена входа, стоп, цель). Без стопа/цели алерты не работают.",
+                              chat_id)
             return
         t = parts[1].upper()
+        known = {w["ticker"] for w in fetch_quotes.watchlist()}
+        if t not in known:
+            deliver.send_text(f"{t} нет в watchlist — бот не сможет присылать алерты. "
+                              f"Добавьте тикер в конфиг или выберите из /watchlist.", chat_id)
+            return
         try:
             price = float(parts[2].replace(",", "."))
+            stop = float(parts[3].replace(",", ".")) if len(parts) > 3 else None
+            target = float(parts[4].replace(",", ".")) if len(parts) > 4 else None
         except ValueError:
-            deliver.send_text("Цена не распознана.", chat_id)
+            deliver.send_text("Цена/стоп/цель не распознаны. Формат: /trade SPBE 178.3 175 185", chat_id)
             return
-        tid = store.add_trade(t, price)
+        if stop is None or target is None:
+            # попробуем взять стоп/цель из текущего вердикта по бумаге
+            try:
+                from . import indicators, intraday
+                bars = intraday.fetch_bars(t)
+                ind = intraday.analyze_bars(bars)
+                daily_ind = None
+                try:
+                    daily_ind = indicators.compute(db.get_candles(t))
+                except Exception:
+                    pass
+                if ind:
+                    v = intraday.verdict(t, ind, daily_ind)
+                    stop, target = v["stop"], v["target"]
+            except Exception as e:
+                log.warning("trade stop/target %s: %s", t, e)
+        if not stop or not target or not (stop < price < target):
+            deliver.send_text("Не удалось определить стоп/цель (или они некорректны: "
+                              "стоп < цена < цель). Укажите явно: /trade SPBE 178.3 175 185", chat_id)
+            return
+        tid = store.add_trade(t, price, note="ручной вход /trade")
+        pid = store.open_position(t, price, stop, target, mode="real")
         deliver.send_text(f"📝 Сделка #{tid}: <b>{t}</b> вход {price:g} ₽ записана.\n"
+                          f"Позиция #{pid}: стоп {stop:g} · цель {target:g} — пришлю алерт при срабатывании.\n"
                           f"Закрыть: /close {tid} ЦЕНА", chat_id)
 
     elif text.startswith("/close"):
@@ -423,25 +455,22 @@ def handle_update(msg: dict):
         if not r:
             deliver.send_text(f"Сделка #{tid} не найдена.", chat_id)
             return
+        # закрываем и связанную позицию, чтобы алерты стоп/цель больше не слали
+        try:
+            for p in store.active_positions(mode="real"):
+                if p["ticker"] == r["ticker"]:
+                    store.close_position(p["id"], "manual_close")
+        except Exception as e:
+            log.warning("close position after /close: %s", e)
         emoji = "🟢" if r["pnl_pct"] > 0 else ("🔴" if r["pnl_pct"] < 0 else "⚪")
         deliver.send_text(f"{emoji} Сделка #{r['id']} ({r['ticker']}) закрыта: "
                           f"{r['entry']:g} → {r['exit']:g} ₽\n"
                           f"Итог (с учётом комиссии): <b>{r['pnl_pct']:+.2f}%</b>", chat_id)
 
     elif text.startswith("/paper"):
-        from . import store
-        pos = store.active_positions(mode="paper")
-        stats = store.trade_stats(30, mode="paper")
-        open_lines = "\n".join(
-            f"• {p['ticker']}: вход {float(p['entry_price']):g} · стоп {float(p['stop']):g} · "
-            f"цель {float(p['target']):g}" for p in pos) or "• открытых нет"
-        wr = f"{stats['win_rate']}%" if stats['win_rate'] is not None else "—"
-        deliver.send_text(
-            f"🧪 <b>Бумажная торговля</b> (бот сам входит по вердиктам и выходит по цели/стопу)\n\n"
-            f"Открыто сейчас:\n{open_lines}\n\n"
-            f"Результаты (30 дней):\n"
-            f"• закрыто: {stats['closed']} · винрейт: {wr}\n"
-            f"• итог: <b>{stats['total_pnl_pct']:+.2f}%</b>", chat_id)
+        text_out = deliver.paper_summary()
+        deliver.send_text(text_out or "🧪 Бумажных данных пока нет — эксперимент начнётся "
+                          "в ближайшую торговую сессию.", chat_id)
 
     elif text.startswith("/stats"):
         from . import store
@@ -453,49 +482,69 @@ def handle_update(msg: dict):
         wr = f"{s['win_rate']}%" if s["win_rate"] is not None else "—"
         deliver.send_text(
             f"💼 <b>Статистика сделок (30 дней)</b>\n"
-            f"• закрыто: {s['closed']}\n"
+            f"• закрыто: {s['closed']} · открыто позиций: {s['open']}\n"
             f"• в плюс: {s['wins']} · в минус: {s['losses']}\n"
             f"• винрейт: {wr}\n"
             f"• средняя сделка: {s['avg_pnl_pct']:+.2f}%\n"
-            f"• итог: <b>{s['total_pnl_pct']:+.2f}%</b>", chat_id)
+            f"• итог (с издержками ~{s['avg_fee_pct'] or 0}%): <b>{s['total_pnl_pct']:+.2f}%</b>\n"
+            f"• макс. просадка: {s['max_drawdown_pct']:.2f}%", chat_id)
 
     elif text.startswith("/backtest"):
         deliver.send_text("Считаю бэктест сигналов…", chat_id)
         try:
             from . import store, intraday
             hist = store.signals_history(30)
-            rows = [h for h in hist if h.get("direction") in ("long", "short")
-                    and h.get("payload")]
-            if not rows:
-                deliver.send_text("Истории сигналов пока нет (она копится с бэктест-логом).", chat_id)
-                return
-            fee = float(intraday._cfg("fee_pct", 1.0))
+            default_fee = float(intraday._cfg("fee_pct", 1.0))
+            prices_now = db.latest_prices() or {}
             checked = wins = 0
             total = 0.0
-            for h in rows:
-                p = h.get("payload") or {}
-                ticker = p.get("ticker") or h.get("ticker")
+            paper_n = llm_n = 0
+            for h in hist:
+                p = h.get("payload")
+                if not isinstance(p, dict):
+                    continue
+                kind = h.get("kind")
                 direction = p.get("direction") or h.get("direction")
-                entry = db.price_at(ticker, h["created_at"])
-                now_p = (db.quote_stats(ticker) or {}).get("last")
+                if kind == "paper":
+                    # бумажные: считаем только реальные входы по вердикту enter
+                    if p.get("call") != "enter" or direction != "long":
+                        continue
+                elif kind in ("brief", "evening"):
+                    if direction not in ("long", "short"):
+                        continue
+                else:
+                    continue
+                ticker = p.get("ticker") or h.get("ticker")
+                # цена сигнала сохранена в payload; фолбек — кеш котировок (может быть пуст после деплоя)
+                entry = p.get("price_at_signal") or db.price_at(ticker, h["created_at"])
+                now_p = prices_now.get(ticker, {}).get("last") or \
+                    (db.quote_stats(ticker) or {}).get("last")
                 if not entry or not now_p:
                     continue
+                fee = float(p.get("fee_pct") or default_fee)
                 chg = (now_p / entry - 1) * 100
                 net = chg - fee if direction == "long" else -chg - fee
                 checked += 1
                 total += net
                 if net > 0:
                     wins += 1
+                if kind == "paper":
+                    paper_n += 1
+                else:
+                    llm_n += 1
             if not checked:
-                deliver.send_text("Не хватает цен для бэктеста.", chat_id)
+                deliver.send_text("Не хватает данных для бэктеста: история сигналов копится "
+                                  "с каждым брифингом и бумажным сканом (цена фиксируется в сигнале).", chat_id)
                 return
             wr = wins / checked * 100
             deliver.send_text(
-                f"📉 <b>Бэктест сигналов (30 дней, комиссия {fee}%)</b>\n"
-                f"• проверено: {checked}\n"
-                f"• в плюс: {wins} ({wr:.0f}%)\n"
+                f"📉 <b>Бэктест сигналов (30 дней, с издержками)</b>\n"
+                f"• проверено: {checked} (бумажных enter: {paper_n}, брифинги: {llm_n})\n"
+                f"• в плюс после комиссии: {wins} ({wr:.0f}%)\n"
                 f"• суммарно: {total:+.2f}%\n"
-                f"• в среднем: {total / checked:+.2f}% за сделку", chat_id)
+                f"• в среднем: {total / checked:+.2f}% за сигнал\n"
+                f"<i>Оценка «цена сигнала → цена сейчас»; для бумажных входов горизонт 3-4 дня.</i>",
+                chat_id)
         except Exception as e:
             log.exception("backtest failed")
             deliver.send_text(f"Ошибка бэктеста: {e}", chat_id)
@@ -569,5 +618,9 @@ def _poll_loop():
 def start_polling():
     if not TELEGRAM_BOT_TOKEN:
         log.warning("TELEGRAM_BOT_TOKEN не задан — бот выключен")
+        return
+    if not _ALLOWED_IDS:
+        log.error("TELEGRAM_ALLOWED_IDS пуст — команды не принимает никто (безопасный режим). "
+                  "Задайте TELEGRAM_ALLOWED_IDS в переменных Render и перезапустите сервис.")
         return
     threading.Thread(target=_poll_loop, daemon=True, name="tg-poll").start()
