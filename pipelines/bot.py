@@ -4,9 +4,11 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
+from datetime import datetime, timezone
 
 from .http import session as requests_session
-from . import analyze, db, deliver, fetch_quotes, llm
+from . import analyze, db, deliver, fetch_quotes, llm, store
 from .settings import (_ALLOWED_IDS, DEEPSEEK_API_KEY, EXA_API_KEY, GROQ_API_KEY,
                        GROQ_TTS_MODEL, GROQ_TTS_VOICE, TELEGRAM_BOT_TOKEN,
                        VOICE_REPLIES, setup_logging)
@@ -213,11 +215,25 @@ def _answer(text: str) -> str:
 
 # ---------------- Обработка апдейтов ----------------
 
+def _meta_set(key: str, value: str):
+    """Телеметрия в постоянную базу: видно снаружи, даже когда логи Render недоступны."""
+    try:
+        store.set_meta(key, value)
+    except Exception as e:
+        log.warning("meta %s: %s", key, e)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def handle_update(msg: dict):
     chat_id = msg["chat"]["id"]
     if not _authorized(chat_id):
         log.warning("чужой chat_id=%s — игнор", chat_id)
+        _meta_set("tg_rejected_id", str(chat_id))
         return
+    _meta_set("tg_last_chat_id", str(chat_id))
 
     if "voice" in msg or "audio" in msg:
         fid = msg.get("voice", msg.get("audio", {}))["file_id"]
@@ -595,6 +611,8 @@ _offset = 0
 def _poll_loop():
     global _offset
     log.info("polling запущен")
+    _meta_set("tg_poll_alive", _utc_now())
+    last_hb = time.time()
     while True:
         try:
             r = requests_session.get(f"{API}/getUpdates",
@@ -603,6 +621,7 @@ def _poll_loop():
                              timeout=40)
             for u in r.json().get("result", []):
                 _offset = u["update_id"] + 1
+                _meta_set("tg_last_update_at", _utc_now())
                 msg = u.get("message")
                 if msg:
                     try:
@@ -611,8 +630,10 @@ def _poll_loop():
                         log.exception("update failed")
         except Exception as e:
             log.warning("poll: %s", e)
-            import time
             time.sleep(5)
+        if time.time() - last_hb > 300:
+            _meta_set("tg_poll_alive", _utc_now())
+            last_hb = time.time()
 
 
 def start_polling():
@@ -622,5 +643,8 @@ def start_polling():
     if not _ALLOWED_IDS:
         log.error("TELEGRAM_ALLOWED_IDS пуст — команды не принимает никто (безопасный режим). "
                   "Задайте TELEGRAM_ALLOWED_IDS в переменных Render и перезапустите сервис.")
+        _meta_set("tg_allowed_count", "0")
         return
+    _meta_set("tg_allowed_count", str(len(_ALLOWED_IDS)))
+    _meta_set("tg_bot_started", _utc_now())
     threading.Thread(target=_poll_loop, daemon=True, name="tg-poll").start()
