@@ -607,6 +607,15 @@ def handle_update(msg: dict):
 
 _offset = 0
 
+# Живое состояние поллера: отдаётся в health-ответе (логи Render недоступны).
+POLL_STATE = {"ok": "", "updates": 0, "errors": 0, "last_error": "", "last_update": ""}
+
+
+def poll_status() -> str:
+    s = POLL_STATE
+    return (f"poll_ok={s['ok'] or '-'} updates={s['updates']} errors={s['errors']} "
+            f"last_msg={s['last_update'] or '-'} err={s['last_error'][:60] or '-'}")
+
 
 def _poll_loop():
     global _offset
@@ -619,7 +628,10 @@ def _poll_loop():
                              params={"timeout": 25, "offset": _offset,
                                      "allowed_updates": ["message"]},
                              timeout=40)
+            POLL_STATE["ok"] = _utc_now()
             for u in r.json().get("result", []):
+                POLL_STATE["updates"] += 1
+                POLL_STATE["last_update"] = _utc_now()
                 _offset = u["update_id"] + 1
                 _meta_set("tg_last_update_at", _utc_now())
                 msg = u.get("message")
@@ -630,6 +642,8 @@ def _poll_loop():
                         log.exception("update failed")
         except Exception as e:
             log.warning("poll: %s", e)
+            POLL_STATE["errors"] += 1
+            POLL_STATE["last_error"] = f"{_utc_now()} {type(e).__name__}: {e}"
             time.sleep(5)
         if time.time() - last_hb > 300:
             _meta_set("tg_poll_alive", _utc_now())

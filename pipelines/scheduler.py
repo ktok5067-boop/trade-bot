@@ -512,6 +512,14 @@ def run_cycle():
     return ran
 
 
+CYCLE_STATE = {"n": 0, "last": "", "err": ""}
+
+
+def cycle_status() -> str:
+    return (f"cycles={CYCLE_STATE['n']} last_cycle={CYCLE_STATE['last'] or '-'} "
+            f"cycle_err={CYCLE_STATE['err'][:60] or '-'}")
+
+
 def start_health_server(port: int):
     """Мини-HTTP для платформ, требующих открытый порт (Hugging Face Spaces: 7860)."""
     import threading
@@ -519,9 +527,12 @@ def start_health_server(port: int):
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            body = f"trade-bot is running | {bot.poll_status()} | {cycle_status()}".encode()
             self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(b"trade-bot is running")
+            self.wfile.write(body)
 
         def log_message(self, *args):
             pass
@@ -555,10 +566,13 @@ def main():
     while True:
         try:
             run_cycle()
+            CYCLE_STATE["n"] += 1
+            CYCLE_STATE["last"] = db.now_iso()
         except KeyboardInterrupt:
             log.info("остановка")
             break
-        except Exception:
+        except Exception as e:
+            CYCLE_STATE["err"] = f"{db.now_iso()} {type(e).__name__}: {e}"
             log.exception("cycle failed")
         time.sleep(20)
 
