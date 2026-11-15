@@ -159,8 +159,18 @@ def intraday_scan():
 
     Антиспам: ТОП-1 событие на бумагу за скан; дневной лимит max_per_day на весь
     пул (claim-then-send: cooldown-метку ставим только после успешной отправки).
+    Выходные/праздники: последний бар не сегодняшний — скан пропускается
+    (иначе алерты по пятничным барам уходят два дня спустя).
     """
     from . import intraday
+    try:
+        probe = intraday.fetch_bars("SBER")
+        today_msk = datetime.now(MSK_TZ).strftime("%Y-%m-%d")
+        if not probe or probe[-1]["ts"][:10] != today_msk:
+            return
+    except Exception as e:
+        log.warning("intraday probe: %s", e)
+        return
     max_per_day = int(CONFIG["intraday"].get("max_per_day", 12))
     for secid in db.get_pool():
         try:
@@ -389,6 +399,19 @@ def paper_trading():
             pass
 
     if not cfg.get("paper_trading", False):
+        return
+    # Рынок РЕАЛЬНО торгуется? Последняя 10-мин свеча должна быть сегодняшней (МСК).
+    # Без этой проверки в выходные/праздники бот входит по пятничным барам
+    # и пятничным ценам — мусор в статистике эксперимента.
+    try:
+        probe = intraday.fetch_bars("SBER")
+        today_msk = datetime.now(MSK_TZ).strftime("%Y-%m-%d")
+        last_bar_day = probe[-1]["ts"][:10] if probe else "нет"
+        if last_bar_day != today_msk:
+            _dbg(f"вне сессии: последний бар {last_bar_day}, сегодня {today_msk} — входы пропущены")
+            return
+    except Exception as e:
+        _dbg(f"probe failed: {type(e).__name__}: {str(e)[:100]}")
         return
     try:
         active = store.active_positions(mode="paper")
