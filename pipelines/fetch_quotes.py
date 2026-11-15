@@ -57,6 +57,7 @@ def fetch_snapshot() -> list[dict]:
             "prev": s.get("PREVPRICE"),
             "chg_pct": m.get("LASTTOPREVPRICE"),
             "voltoday": m.get("VOLTODAY") or 0,
+            "valtoday": m.get("VALTODAY") or 0,  # денежный объём, ₽
         })
     if rows:
         db.save_prices(rows)

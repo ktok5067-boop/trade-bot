@@ -88,7 +88,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS prices (
             secid TEXT, ts TEXT, shortname TEXT,
             last REAL, open REAL, high REAL, low REAL, prev REAL,
-            chg_pct REAL, voltoday INTEGER,
+            chg_pct REAL, voltoday INTEGER, valtoday REAL,
             PRIMARY KEY (secid, ts));
         CREATE TABLE IF NOT EXISTS candles (
             secid TEXT, ts TEXT, open REAL, close REAL, high REAL, low REAL,
@@ -105,6 +105,10 @@ def init_db():
             created_at TEXT, kind TEXT, payload TEXT);
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
         """)
+        try:  # миграция старых локальных баз: денежный объём в prices
+            c.execute("ALTER TABLE prices ADD COLUMN valtoday REAL")
+        except sqlite3.OperationalError:
+            pass
 
 
 # ---------- meta ----------
@@ -126,8 +130,8 @@ def set_meta(key: str, value: str):
 def save_prices(rows: list[dict]):
     with conn() as c:
         c.executemany(
-            "INSERT OR REPLACE INTO prices(secid,ts,shortname,last,open,high,low,prev,chg_pct,voltoday) "
-            "VALUES(:secid,:ts,:shortname,:last,:open,:high,:low,:prev,:chg_pct,:voltoday)", rows)
+            "INSERT OR REPLACE INTO prices(secid,ts,shortname,last,open,high,low,prev,chg_pct,voltoday,valtoday) "
+            "VALUES(:secid,:ts,:shortname,:last,:open,:high,:low,:prev,:chg_pct,:voltoday,:valtoday)", rows)
 
 
 def save_candles(secid: str, rows: list[dict]):

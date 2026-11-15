@@ -49,7 +49,9 @@ CREATE TABLE IF NOT EXISTS trades (
     qty NUMERIC,
     fee_pct NUMERIC DEFAULT 1.0,
     mode TEXT NOT NULL DEFAULT 'real',
-    note TEXT
+    note TEXT,
+    idx_entry NUMERIC,
+    idx_exit NUMERIC
 );
 CREATE TABLE IF NOT EXISTS positions (
     id SERIAL PRIMARY KEY,
@@ -59,7 +61,8 @@ CREATE TABLE IF NOT EXISTS positions (
     stop NUMERIC,
     target NUMERIC,
     mode TEXT NOT NULL DEFAULT 'real',
-    status TEXT NOT NULL DEFAULT 'open'
+    status TEXT NOT NULL DEFAULT 'open',
+    idx_entry NUMERIC
 );
 CREATE TABLE IF NOT EXISTS signals_log (
     id SERIAL PRIMARY KEY,
@@ -88,7 +91,9 @@ CREATE TABLE IF NOT EXISTS trades (
     qty REAL,
     fee_pct REAL DEFAULT 1.0,
     mode TEXT NOT NULL DEFAULT 'real',
-    note TEXT
+    note TEXT,
+    idx_entry REAL,
+    idx_exit REAL
 );
 CREATE TABLE IF NOT EXISTS positions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,7 +103,8 @@ CREATE TABLE IF NOT EXISTS positions (
     stop REAL,
     target REAL,
     mode TEXT NOT NULL DEFAULT 'real',
-    status TEXT NOT NULL DEFAULT 'open'
+    status TEXT NOT NULL DEFAULT 'open',
+    idx_entry REAL
 );
 CREATE TABLE IF NOT EXISTS signals_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -149,7 +155,10 @@ def _connect_pg():
         if stmt.strip():
             cur.execute(stmt)
     for stmt in ("ALTER TABLE trades ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'real'",
-                 "ALTER TABLE positions ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'real'"):
+                 "ALTER TABLE positions ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'real'",
+                 "ALTER TABLE trades ADD COLUMN IF NOT EXISTS idx_entry NUMERIC",
+                 "ALTER TABLE trades ADD COLUMN IF NOT EXISTS idx_exit NUMERIC",
+                 "ALTER TABLE positions ADD COLUMN IF NOT EXISTS idx_entry NUMERIC"):
         cur.execute(stmt)
     cur.close()
     return c
@@ -162,9 +171,13 @@ def _connect_sqlite():
     for stmt in _SCHEMA_SQLITE.split(";"):
         if stmt.strip():
             cur.execute(stmt)
-    for col, tbl in (("mode", "trades"), ("mode", "positions")):
+    for col, tbl, typ in (("mode", "trades", "TEXT NOT NULL DEFAULT 'real'"),
+                          ("mode", "positions", "TEXT NOT NULL DEFAULT 'real'"),
+                          ("idx_entry", "trades", "REAL"),
+                          ("idx_exit", "trades", "REAL"),
+                          ("idx_entry", "positions", "REAL")):
         try:
-            cur.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} TEXT NOT NULL DEFAULT 'real'")
+            cur.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
             pass
     cur.close()
@@ -313,7 +326,8 @@ def close_trade(trade_id: int, exit_price: float, qty: float | None = None, note
             "exit": exit_price, "pnl_pct": round(pnl_pct, 2)}
 
 
-def record_paper_exit(position: dict, exit_price: float, reason: str) -> dict | None:
+def record_paper_exit(position: dict, exit_price: float, reason: str,
+                      idx_exit: float | None = None) -> dict | None:
     """Атомарно: сделка + закрытие позиции. Чтобы обрыв не терял результат."""
     ticker = position["ticker"]
     entry = float(position["entry_price"])
@@ -329,9 +343,11 @@ def record_paper_exit(position: dict, exit_price: float, reason: str) -> dict | 
             cur = _conn.cursor()
             try:
                 cur.execute(
-                    "INSERT INTO trades(ticker, side, entry_price, exit_price, qty, fee_pct, mode, note, created_at) "
-                    "VALUES(%s,'long',%s,%s,0,%s,'paper',%s,%s) RETURNING id",
-                    (ticker, entry, exit_price, fee, note, _now()))
+                    "INSERT INTO trades(ticker, side, entry_price, exit_price, qty, fee_pct, mode, note, "
+                    "idx_entry, idx_exit, created_at) "
+                    "VALUES(%s,'long',%s,%s,0,%s,'paper',%s,%s,%s,%s) RETURNING id",
+                    (ticker, entry, exit_price, fee, note,
+                     position.get("idx_entry"), idx_exit, _now()))
                 tid = int(cur.fetchone()[0])
                 cur.execute("UPDATE positions SET status=%s WHERE id=%s",
                             (reason + "_hit", pos_id))
@@ -346,9 +362,11 @@ def record_paper_exit(position: dict, exit_price: float, reason: str) -> dict | 
             cur = _conn.cursor()
             try:
                 cur.execute(
-                    "INSERT INTO trades(ticker, side, entry_price, exit_price, qty, fee_pct, mode, note, created_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?)",
-                    (ticker, "long", entry, exit_price, 0, fee, "paper", note, _now()))
+                    "INSERT INTO trades(ticker, side, entry_price, exit_price, qty, fee_pct, mode, note, "
+                    "idx_entry, idx_exit, created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (ticker, "long", entry, exit_price, 0, fee, "paper", note,
+                     position.get("idx_entry"), idx_exit, _now()))
                 tid = int(cur.lastrowid)
                 cur.execute("UPDATE positions SET status=? WHERE id=?",
                             (reason + "_hit", pos_id))
@@ -386,12 +404,15 @@ def trade_stats(days: int = 30, mode: str | None = None) -> dict:
         open_n = 0
     base = {"closed": 0, "open": open_n, "wins": 0, "losses": 0, "win_rate": None,
             "avg_pnl_pct": None, "total_pnl_pct": 0.0, "max_drawdown_pct": 0.0,
-            "avg_fee_pct": None, "first_trade_at": None, "last_trade_at": None}
+            "avg_fee_pct": None, "first_trade_at": None, "last_trade_at": None,
+            "alpha_n": 0, "alpha_wins": 0, "alpha_total_pct": 0.0, "alpha_avg_pct": None}
     if not trades:
         return base
     wins = losses = 0
     total = 0.0
     fees = 0.0
+    alpha_n = alpha_wins = 0
+    alpha_total = 0.0
     cum = 0.0
     peak = 0.0
     max_dd = 0.0
@@ -409,6 +430,14 @@ def trade_stats(days: int = 30, mode: str | None = None) -> dict:
             wins += 1
         else:
             losses += 1
+        # альфа: насколько сделка обогнала индекс за то же время (IMOEX на входе/выходе)
+        ie, ix = t.get("idx_entry"), t.get("idx_exit")
+        if ie and ix:
+            alpha = pnl - (float(ix) / float(ie) - 1) * 100
+            alpha_n += 1
+            alpha_total += alpha
+            if alpha > 0:
+                alpha_wins += 1
     n = len(trades)
     base.update({
         "closed": n, "wins": wins, "losses": losses,
@@ -419,6 +448,9 @@ def trade_stats(days: int = 30, mode: str | None = None) -> dict:
         "avg_fee_pct": round(fees / n, 2),
         "first_trade_at": trades[0].get("created_at"),
         "last_trade_at": trades[-1].get("created_at"),
+        "alpha_n": alpha_n, "alpha_wins": alpha_wins,
+        "alpha_total_pct": round(alpha_total, 2) if alpha_n else 0.0,
+        "alpha_avg_pct": round(alpha_total / alpha_n, 2) if alpha_n else None,
     })
     return base
 
@@ -426,13 +458,13 @@ def trade_stats(days: int = 30, mode: str | None = None) -> dict:
 # ----------------------- positions -----------------------
 
 def open_position(ticker: str, entry_price: float, stop: float, target: float,
-                  mode: str = "real") -> int:
-    params = (ticker, entry_price, stop, target, mode, _now())
+                  mode: str = "real", idx_entry: float | None = None) -> int:
+    params = (ticker, entry_price, stop, target, mode, idx_entry, _now())
     return _insert_id(
-        "INSERT INTO positions(ticker, entry_price, stop, target, mode, status, created_at) "
-        "VALUES(%s,%s,%s,%s,%s,'open',%s)",
-        "INSERT INTO positions(ticker, entry_price, stop, target, mode, status, created_at) "
-        "VALUES(?,?,?,?,?,'open',?)",
+        "INSERT INTO positions(ticker, entry_price, stop, target, mode, idx_entry, status, created_at) "
+        "VALUES(%s,%s,%s,%s,%s,%s,'open',%s)",
+        "INSERT INTO positions(ticker, entry_price, stop, target, mode, idx_entry, status, created_at) "
+        "VALUES(?,?,?,?,?,?, 'open',?)",
         params)
 
 

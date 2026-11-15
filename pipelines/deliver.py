@@ -241,6 +241,11 @@ def paper_summary() -> str:
     if stats["closed"] < 30:
         note = ("\n<i>Сделок пока мало — винрейт без большой выборки не показатель, "
                 "наблюдаем дальше.</i>")
+    alpha_line = ""
+    if stats.get("alpha_n"):
+        alpha_line = (f"\nПротив IMOEX (альфа): <b>{stats.get('alpha_total_pct', 0):+.2f}%</b> · "
+                      f"{stats['alpha_wins']}/{stats['alpha_n']} сделок лучше рынка "
+                      f"(средняя {stats.get('alpha_avg_pct', 0):+.2f}%)")
     return (f"🧪 <b>Бумажная торговля</b> (вход только по вердикту «enter», "
             f"выход: цель/стоп/время ~4 торговых дня)\n"
             f"{start_line}\n"
@@ -248,7 +253,7 @@ def paper_summary() -> str:
             f"Закрыто: {stats['closed']} · в плюс: {stats['wins']} · в минус: {stats['losses']}\n"
             f"Винрейт: {wr} · средняя сделка: {avg}\n"
             f"Итог (с издержками ~{stats['avg_fee_pct'] or 0}%): <b>{stats['total_pnl_pct']:+.2f}%</b> · "
-            f"макс. просадка: {stats['max_drawdown_pct']:.2f}%{note}")
+            f"макс. просадка: {stats['max_drawdown_pct']:.2f}%{alpha_line}{note}")
 
 
 def send_voice_ogg(ogg_bytes: bytes, chat_id: str | int):

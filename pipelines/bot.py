@@ -294,9 +294,11 @@ def handle_update(msg: dict):
             if t in prices:
                 p = prices[t]
                 chg = f" ({p['chg_pct']:+.2f}%)" if p.get("chg_pct") is not None else ""
+                vt = p.get("valtoday")
+                vline = f" · объём {vt / 1e6:.1f} млн ₽" if vt else ""
                 wname = next((w.get("name", "") for w in fetch_quotes.watchlist()
                               if w["ticker"] == t), "")
-                deliver.send_text(f"{t} ({wname}): {p['last']} ₽{chg} (на {p['ts']} МСК)",
+                deliver.send_text(f"{t} ({wname}): {p['last']} ₽{chg}{vline} (на {p['ts']} МСК)",
                                   chat_id)
             else:
                 candles = db.get_candles(t, limit=1)

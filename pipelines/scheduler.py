@@ -295,6 +295,12 @@ def check_positions():
         prices = db.latest_prices() or {}
     except Exception:
         prices = {}
+    # значение IMOEX на момент выхода — для альфы (сделка против рынка)
+    idx_exit = None
+    try:
+        idx_exit = (fetch_quotes.fetch_index() or {}).get("value")
+    except Exception as e:
+        log.warning("positions idx: %s", e)
     exit_days = int(CONFIG.get("intraday", {}).get("paper_exit_days", 4))
     for p in positions:
         ticker = p["ticker"]
@@ -311,7 +317,7 @@ def check_positions():
         mode = p.get("mode") or "real"
         if last <= stop:
             if mode == "paper":
-                _paper_close(p, last, "stop")
+                _paper_close(p, last, "stop", idx_exit)
             else:
                 deliver.send_text(
                     f"🛑 <b>СТОП пробит</b> — {ticker}\n"
@@ -319,21 +325,22 @@ def check_positions():
                 store.close_position(p["id"], "stop_hit")
         elif last >= target:
             if mode == "paper":
-                _paper_close(p, last, "target")
+                _paper_close(p, last, "target", idx_exit)
             else:
                 deliver.send_text(
                     f"🎯 <b>ЦЕЛЬ достигнута</b> — {ticker}\n"
                     f"Цена {last:g} ≥ цель {target:g} ₽. Фиксируйте прибыль.")
                 store.close_position(p["id"], "target_hit")
         elif mode == "paper" and _trading_days_since(p.get("created_at")) >= exit_days:
-            _paper_close(p, last, "time")
+            _paper_close(p, last, "time", idx_exit)
 
 
-def _paper_close(p: dict, exit_price: float, reason: str):
+def _paper_close(p: dict, exit_price: float, reason: str,
+                 idx_exit: float | None = None):
     """Атомарно закрыть бумажную позицию и записать сделку с причиной выхода."""
     from . import store
     try:
-        r = store.record_paper_exit(p, exit_price, reason)
+        r = store.record_paper_exit(p, exit_price, reason, idx_exit=idx_exit)
     except Exception as e:
         log.warning("paper close %s: %s", p.get("ticker"), e)
         return
@@ -352,8 +359,25 @@ def _paper_close(p: dict, exit_price: float, reason: str):
         f"итог <b>{r['pnl_pct'] if r else 0:+.2f}%</b>")
 
 
+def _paper_entries_key() -> str:
+    """Ключ meta: счётчик НОВЫХ бумажных входов за сегодня (зона владельца)."""
+    return f"paper_entries_{now_local().strftime('%Y-%m-%d')}"
+
+
+def paper_entries_today() -> int:
+    raw = db.get_meta(_paper_entries_key())
+    try:
+        return int(raw) if raw else 0
+    except (TypeError, ValueError):
+        return 0
+
+
 def paper_trading():
-    """Бумажная торговля: вход ТОЛЬКО по вердикту 'enter', с лимитом и кулдауном."""
+    """Бумажная торговля: вход ТОЛЬКО по вердикту 'enter', с лимитом и кулдауном.
+
+    Разнос входов: не более paper_max_new_per_day новых позиций в день —
+    чтобы выборка ложилась на разные рыночные режимы, а не на один день.
+    """
     from . import intraday, store
     cfg = CONFIG.get("intraday", {})
     if not cfg.get("paper_trading", False):
@@ -365,7 +389,7 @@ def paper_trading():
         max_open = int(cfg.get("paper_max_open", top_n))
         if len(active) >= max_open:
             return
-        scored = intraday.rank_paper(fetch_quotes.tickers(), top_n=top_n)
+        scored, idx = intraday.rank_paper(fetch_quotes.tickers(), top_n=top_n)
     except Exception as e:
         log.warning("paper screener: %s", e)
         return
@@ -395,6 +419,8 @@ def paper_trading():
                 "price_at_signal": v["entry"], "stop": v["stop"], "target": v["target"],
                 "confirmations": v.get("confirmations", []),
                 "fee_pct": v.get("fee_pct"), "signal_ts": db.now_iso(),
+                "idx_value": idx.get("value"), "idx_chg": idx.get("chg_pct"),
+                "vol_ratio": v.get("vol_ratio"), "pulse_ratio": v.get("pulse_ratio"),
             })
             markers.append((key, marker))
         if payloads:
@@ -404,6 +430,11 @@ def paper_trading():
     except Exception as e:
         log.warning("paper signal log: %s", e)
 
+    # Разнос входов: дневной лимит НОВЫХ позиций (после логирования сигналов).
+    max_new = int(cfg.get("paper_max_new_per_day", 2))
+    if paper_entries_today() >= max_new:
+        return
+    idx_val = idx.get("value")
     entered = 0
     cooldown_hours = float(cfg.get("paper_cooldown_hours", 24))
     for row in scored:
@@ -427,8 +458,10 @@ def paper_trading():
             pass
         try:
             store.open_position(t, float(v["entry"]), float(v["stop"]),
-                                float(v["target"]), mode="paper")
+                                float(v["target"]), mode="paper",
+                                idx_entry=float(idx_val) if idx_val else None)
             entered += 1
+            db.set_meta(_paper_entries_key(), str(paper_entries_today() + 1))
             deliver.send_text(
                 f"🧪 <b>Бумажный вход</b> — {t}\n"
                 f"{v['entry']:g} ₽ · стоп {v['stop']:g} · цель {v['target']:g}\n"

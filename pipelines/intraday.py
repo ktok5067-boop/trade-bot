@@ -769,6 +769,8 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None,
         "net_pct": round(net_pct, 2),
         "confirmations": sorted(confirmations),
         "idx_chg": idx_chg,
+        "vol_ratio": ind.get("vol_ratio"),
+        "pulse_ratio": ind.get("pulse_ratio"),
     }
 
 
@@ -848,11 +850,12 @@ def screener(tickers: list[str], top_n: int = 3) -> list[dict]:
     return scored[:top_n]
 
 
-def rank_paper(tickers: list[str], top_n: int = 5) -> list[dict]:
+def rank_paper(tickers: list[str], top_n: int = 5) -> tuple[list[dict], dict]:
     """Лёгкое ранжирование для бумажной торговли (без повторного скачивания свечей).
 
     Использует уже закешированные дневные свечи (их обновляет update_all при
     опросе котировок), чтобы не дёргать MOEX каждые 10 минут по 34 бумагам.
+    Возвращает (scored, idx) — индекс нужен для фиксации альфы на входе.
     """
     from . import fetch_quotes, indicators
     idx = None
@@ -886,4 +889,4 @@ def rank_paper(tickers: list[str], top_n: int = 5) -> list[dict]:
         except Exception as e:
             log.warning("rank_paper %s: %s", t, e)
     scored.sort(key=lambda x: -x["verdict"]["score"])
-    return scored[:top_n]
+    return scored[:top_n], (idx or {})
