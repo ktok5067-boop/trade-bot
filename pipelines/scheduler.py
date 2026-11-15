@@ -377,9 +377,17 @@ def paper_trading():
 
     Разнос входов: не более paper_max_new_per_day новых позиций в день —
     чтобы выборка ложилась на разные рыночные режимы, а не на один день.
+    Телеметрия в store (dbg_paper) — видна снаружи, когда логи Render недоступны.
     """
     from . import intraday, store
     cfg = CONFIG.get("intraday", {})
+
+    def _dbg(msg: str):
+        try:
+            store.set_meta("dbg_paper", f"{db.now_iso()} {msg}")
+        except Exception:
+            pass
+
     if not cfg.get("paper_trading", False):
         return
     try:
@@ -388,10 +396,19 @@ def paper_trading():
         top_n = int(cfg.get("paper_top_n", 5))
         max_open = int(cfg.get("paper_max_open", top_n))
         if len(active) >= max_open:
+            _dbg(f"полно: {len(active)}/{max_open} позиций — скан пропущен")
             return
         scored, idx = intraday.rank_paper(fetch_quotes.tickers(), top_n=top_n)
+        _dbg(f"ranked={len(scored)} active={len(active)} idx={idx.get('value')}")
+        if not scored:  # диагностика: MOEX недоступен или сетапов нет?
+            try:
+                b = intraday.fetch_bars("SBER")
+                _dbg(f"ranked=0 probe: SBER bars={len(b)}")
+            except Exception as e:
+                _dbg(f"ranked=0 probe failed: {type(e).__name__}: {str(e)[:100]}")
     except Exception as e:
         log.warning("paper screener: %s", e)
+        _dbg(f"ERR screener: {type(e).__name__}: {str(e)[:120]}")
         return
 
     # Логируем кандидатов с ценой/вердиктом — для честной статистики enter vs wait.
@@ -427,8 +444,10 @@ def paper_trading():
             store.log_signal("paper", payloads)
             for key, marker in markers:
                 store.set_meta(key, marker)
+        _dbg(f"logged={len(payloads)} markers={len(markers)}")
     except Exception as e:
         log.warning("paper signal log: %s", e)
+        _dbg(f"ERR log: {type(e).__name__}: {str(e)[:120]}")
 
     # Разнос входов: дневной лимит НОВЫХ позиций (после логирования сигналов).
     max_new = int(cfg.get("paper_max_new_per_day", 2))
@@ -471,6 +490,7 @@ def paper_trading():
             log.warning("paper open %s: %s", t, e)
     if entered:
         log.info("paper: открыто %d позиций (лимит %d)", entered, max_open)
+    _dbg(f"entries={entered} новых за день={paper_entries_today()}/{max_new}")
 
 
 def healthcheck_ping(ok: bool = True):
