@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 
-from . import db, deliver, intraday
+from . import db, intraday
 from .settings import CONFIG
 
 log = logging.getLogger("deep_candidates")
@@ -66,20 +66,21 @@ def send_candidates(top_n: int = 3):
     tickers = ", ".join(r["ticker"] for r in rows)
     body = "\n\n".join(_line(r) for r in rows)
     text = (
-        "🔎 <b>Кандидаты на глубокий разбор</b>\n"
-        "Бот прошёл весь список; эти бумаги сочёл самыми интересными.\n\n"
+        "Кандидаты на глубокий разбор (бот прошёл весь список)\n"
+        "=====================================================\n\n"
         f"{body}\n\n"
-        "<b>Как получить разбор:</b>\n"
-        "Запустите на компьютере:\n"
-        + "\n".join(f"<code>deep_analysis.bat {r['ticker']}</code>" for r in rows)
-        + f"\n\n💡 Аналитики работают <b>15-30 минут</b> на бумагу и объяснят "
-        f"<b>почему</b>: спор быка с медведем, уровни, риски.\n"
-        f"Бот показал <b>что</b> смотреть — это набор: {tickers}."
+        "Запустить разбор (15-30 мин на бумагу):\n"
+        + "\n".join(f"  deep_analysis.bat {r['ticker']}" for r in rows)
+        + f"\n\nБот показал ЧТО смотреть: {tickers}."
     )
+    # Владелец просил не спамить в чат — пишем в файл, в Telegram не шлём.
+    # Файл — в data/, рядом с persist-базой; переживает рестарты локально.
+    from .settings import DATA_DIR
+    out = DATA_DIR / "deep_candidates.txt"
     try:
-        deliver.send_text(text)
+        out.write_text(text, encoding="utf-8")
     except Exception as e:
-        log.warning("deep candidates send: %s", e)
+        log.warning("deep candidates write: %s", e)
         return
     db.set_meta("last_deep_candidates_date", db.now_msk_date())
-    log.info("кандидаты на разбор отправлены: %s", tickers)
+    log.info("кандидаты на разбор записаны в %s: %s", out, tickers)

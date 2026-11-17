@@ -172,6 +172,7 @@ def intraday_scan():
         log.warning("intraday probe: %s", e)
         return
     max_per_day = int(CONFIG["intraday"].get("max_per_day", 12))
+    to_chat = CONFIG["schedule"].get("send_intraday_alerts", True)
     for secid in db.get_pool():
         try:
             events = intraday.scan(secid)
@@ -191,6 +192,10 @@ def intraday_scan():
                 f"{ind['range_pos']}% диапазона дня ({ind['day_low']:.4g}—{ind['day_high']:.4g})\n"
                 f"💡 {ev['idea']}\n"
                 f"<i>Разбор картины, не рекомендация.</i>")
+        if not to_chat:
+            # владелец не хочет ленту: событие только в лог/базу
+            log.info("интрадей-событие %s %s (в чат не шлём)", secid, ev["ev"]["type"])
+            continue
         if intraday_alerts_today() >= max_per_day:
             log.info("интрадей-лимит %d алертов/день достигнут — %s пропущен",
                      max_per_day, secid)
@@ -363,10 +368,11 @@ def _paper_close(p: dict, exit_price: float, reason: str,
         except Exception as e:
             log.warning("paper cooldown %s: %s", p.get("ticker"), e)
     emoji = "🟢" if (r and r["pnl_pct"] > 0) else "🔴"
-    deliver.send_text(
-        f"{emoji} <b>Бумажная сделка закрыта</b> — {p['ticker']} ({reason})\n"
-        f"{float(p['entry_price']):g} → {exit_price:g} ₽ · "
-        f"итог <b>{r['pnl_pct'] if r else 0:+.2f}%</b>")
+    if CONFIG["schedule"].get("send_paper_events", True):
+        deliver.send_text(
+            f"{emoji} <b>Бумажная сделка закрыта</b> — {p['ticker']} ({reason})\n"
+            f"{float(p['entry_price']):g} → {exit_price:g} ₽ · "
+            f"итог <b>{r['pnl_pct'] if r else 0:+.2f}%</b>")
 
 
 def _paper_entries_key() -> str:
@@ -504,10 +510,11 @@ def paper_trading():
                                 idx_entry=float(idx_val) if idx_val else None)
             entered += 1
             db.set_meta(_paper_entries_key(), str(paper_entries_today() + 1))
-            deliver.send_text(
-                f"🧪 <b>Бумажный вход</b> — {t}\n"
-                f"{v['entry']:g} ₽ · стоп {v['stop']:g} · цель {v['target']:g}\n"
-                f"балл {v['score']}, подтверждений {len(v['confirmations'])}")
+            if CONFIG["schedule"].get("send_paper_events", True):
+                deliver.send_text(
+                    f"🧪 <b>Бумажный вход</b> — {t}\n"
+                    f"{v['entry']:g} ₽ · стоп {v['stop']:g} · цель {v['target']:g}\n"
+                    f"балл {v['score']}, подтверждений {len(v['confirmations'])}")
             log.info("paper open %s (score %s)", t, v["score"])
         except Exception as e:
             log.warning("paper open %s: %s", t, e)
@@ -573,6 +580,13 @@ def run_cycle():
         paper_trading()
         ran = True
 
+    # --- короткие пинги «стоит глянуть» по сильным сетапам ---
+    if is_session(now) and minutes_since("last_setup_ping") >= int(CONFIG.get("intraday", {}).get("setup_ping_interval_min", 30)):
+        touch("last_setup_ping")
+        from . import setup_ping
+        setup_ping.scan_and_ping()
+        ran = True
+
     # --- итоги интрадея: первый цикл после закрытия сессии (один раз в день) ---
     if (not is_session(now)
             and db.get_meta("last_scan")[:10] == now.strftime("%Y-%m-%d")
@@ -580,20 +594,28 @@ def run_cycle():
         intraday_summary()
         ran = True
 
-    # --- брифинг (время в зоне владельца) ---
+    # --- утренний брифинг: считаем всегда, в чат — только если send_brief ---
     bh, bm = _parse_hhmm(cfg["brief_time"])
     brief_dt = now.replace(hour=bh, minute=bm, second=0, microsecond=0)
     if (brief_dt <= now <= brief_dt + timedelta(minutes=90)
             and db.get_meta("last_brief_date") != now.strftime("%Y-%m-%d")):
-        scheduled_report("brief")
+        if cfg.get("send_brief", True):
+            scheduled_report("brief")
+        else:
+            db.set_meta("last_brief_date", now.strftime("%Y-%m-%d"))
+            log.info("брифинг посчитан, но в чат не отправлен (send_brief: false)")
         ran = True
 
-    # --- вечерний итог ---
+    # --- вечерний итог: так же ---
     eh, em = _parse_hhmm(cfg["evening_time"])
     eve_dt = now.replace(hour=eh, minute=em, second=0, microsecond=0)
     if (eve_dt <= now <= eve_dt + timedelta(minutes=90)
             and db.get_meta("last_evening_date") != now.strftime("%Y-%m-%d")):
-        scheduled_report("evening")
+        if cfg.get("send_evening", True):
+            scheduled_report("evening")
+        else:
+            db.set_meta("last_evening_date", now.strftime("%Y-%m-%d"))
+            log.info("вечерний итог посчитан, но в чат не отправлен (send_evening: false)")
         ran = True
 
     # --- кандидаты на глубокий разбор TradingAgents (после вечернего итога) ---
