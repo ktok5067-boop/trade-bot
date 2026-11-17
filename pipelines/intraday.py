@@ -717,16 +717,34 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None,
         score -= 1.0
         reasons.append(f"риск события: {event_risk} (−1)")
 
-    # Вход/стоп/цель: стоп по ATR (не по ближайшему тику, чтобы шум не выбивал)
+    # Вход/стоп/цель. Горизонт владельца — свинг (неделя-две) или пересиживание,
+    # поэтому стоп/цель считаем от ДНЕВНОГО ATR, а не от размаха текущего дня:
+    # внутридневной размах шумный и выбивает из позиции на неделю.
     entry = last
-    atr = None
-    if daily_ind and daily_ind.get("atr14"):
-        atr = daily_ind["atr14"]
-    if not atr:  # фолбек: размах дня как прокси волатильности
-        atr = (hi - lo) or (last * 0.01)
-    stop = round(entry - atr, 4)
-    # цель растянута (target_atr × ATR), чтобы после комиссии оставалась прибыль
-    target = round(entry + float(_cfg("target_atr", 2.0)) * atr, 4)
+    daily_atr = (daily_ind or {}).get("atr14")
+    atr = daily_atr or (hi - lo) or (last * 0.01)
+    horizon = str(_cfg("horizon", "swing")).lower()
+
+    if horizon == "hold":
+        # «Пересиживание»: широкий стоп, цель дальше — позиция живёт месяцами
+        stop_mult = float(_cfg("stop_atr_hold", 2.5))
+        target_mult = float(_cfg("target_atr_hold", 4.0))
+    else:
+        # Свинг: стоп ~1.5 дневных ATR, цель ~3 ATR (R/R 1:2)
+        stop_mult = float(_cfg("stop_atr_swing", 1.5))
+        target_mult = float(_cfg("target_atr_swing", 3.0))
+
+    stop = round(entry - stop_mult * atr, 4)
+    target = round(entry + target_mult * atr, 4)
+
+    # Ближайшая поддержка НИЖЕ цены может уточнить стоп — но только расширить
+    # его (поставить под уровень), никогда не сузить: иначе стоп в 0.5% будет
+    # выбит первым же шумом, что для свинга на неделю бессмысленно.
+    sup_for_stop = levels.get("nearest_support")
+    if sup_for_stop and sup_for_stop < entry:
+        level_stop = round(sup_for_stop - atr * 0.25, 4)
+        if level_stop < stop:  # ниже ATR-стопа — уровень держится лучше, берём его
+            stop = level_stop
 
     # --- учёт издержек (комиссия вход+выход, % от движения) ---
     fee = float(_cfg("fee_pct", 1.0))
@@ -771,6 +789,11 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None,
         "idx_chg": idx_chg,
         "vol_ratio": ind.get("vol_ratio"),
         "pulse_ratio": ind.get("pulse_ratio"),
+        "horizon": horizon,
+        # ориентир удержания: сколько дней цена проходит цель при текущем ATR
+        "hold_days": round((target - entry) / atr, 1) if atr else None,
+        # уровень инвалидации идеи — закрытие ниже него отменяет сценарий
+        "invalidate": round(min(stop, sup_for_stop or stop), 2) if stop else None,
     }
 
 
@@ -795,6 +818,16 @@ def _verdict_line(v: dict) -> str:
             rw = (v["target"] - v["entry"]) / (v["entry"] - v["stop"])
             rr = f" · R/R ≈ 1:{max(rw, 0.1):.1f}"
         parts.append(f"Риск: {v['risk_pct']}%{rr}")
+    # горизонт удержания: свинг или пересиживание
+    horizon = v.get("horizon") or "swing"
+    hname = "пересиживание" if horizon == "hold" else "свинг 1-2 недели"
+    hold = v.get("hold_days")
+    if hold is not None:
+        parts.append(f"Горизонт: {hname} (~{hold:g} дней до цели)")
+    else:
+        parts.append(f"Горизонт: {hname}")
+    if v.get("invalidate"):
+        parts.append(f"Идея отменяется ниже {v['invalidate']:.4g} ₽")
     # издержки и чистая прибыль
     if v.get("net_pct") is not None:
         parts.append(f"Движение: {v.get('gross_pct', 0)}% − комиссия {v.get('fee_pct', 0)}% "

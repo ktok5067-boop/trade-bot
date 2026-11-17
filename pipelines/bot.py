@@ -27,7 +27,7 @@ HELP = """Команды:
 /paper — бумажный эксперимент: входы/выходы бота и статистика
 /backtest — качество прошлых сигналов с учётом комиссии
 /signals — последние сигналы
-/brief — анализ сейчас · /status — состояние бота
+/dividends — дивидендные отсечки · /brief — анализ · /status
 Голосовое сообщение или просто текст — задайте вопрос."""
 
 # Кнопки-меню (ReplyKeyboardMarkup) — дублируют главные функции
@@ -592,6 +592,14 @@ def handle_update(msg: dict):
                 deliver.send_text(f"Сигналов за 24ч много — шлю в {len(msgs)} частях", chat_id)
             for m in msgs:
                 deliver.send_text(m, chat_id=chat_id)
+    elif text.startswith("/dividends"):
+        try:
+            from . import dividends
+            deliver.send_text(dividends.format_table(), chat_id)
+        except Exception as e:
+            log.exception("dividends failed")
+            deliver.send_text(f"Ошибка дивидендов: {e}", chat_id)
+
     elif text.startswith("/brief"):
         deliver.send_text("Запускаю анализ…", chat_id)
         try:

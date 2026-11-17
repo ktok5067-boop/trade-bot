@@ -538,6 +538,17 @@ def run_cycle():
         healthcheck_ping()
         ran = True
 
+    # --- дивидендный календарь: раз в сутки ---
+    if minutes_since("last_divcheck") >= 1440:
+        touch("last_divcheck")
+        try:
+            from . import dividends
+            n = dividends.check_and_alert()
+            if n:
+                log.info("dividends: %d алертов", n)
+        except Exception as e:
+            log.warning("dividends check: %s", e)
+
     # --- котировки (в торговые дни/часы, окно задаётся по МСК) ---
     if is_session(now) and minutes_since("last_quotes") >= cfg["quotes_interval_min"]:
         touch("last_quotes")
