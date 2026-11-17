@@ -39,6 +39,11 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def now_msk_date() -> str:
+    """Текущая дата по Москве (YYYY-MM-DD) — для «раз в день» по биржевому дню."""
+    return datetime.now(ZoneInfo(MSK)).strftime("%Y-%m-%d")
+
+
 def minutes_since_meta(key: str, default: float = 1e9) -> float:
     """Минуты с момента, записанного в meta (now_iso). Иначе default."""
     v = get_meta(key)

@@ -596,6 +596,14 @@ def run_cycle():
         scheduled_report("evening")
         ran = True
 
+    # --- кандидаты на глубокий разбор TradingAgents (после вечернего итога) ---
+    if (eve_dt <= now <= eve_dt + timedelta(minutes=120)
+            and db.get_meta("last_deep_candidates_date") != db.now_msk_date()):
+        from . import deep_candidates
+        deep_candidates.send_candidates(
+            int(CONFIG.get("intraday", {}).get("deep_candidates_top_n", 3)))
+        ran = True
+
     return ran
 
 

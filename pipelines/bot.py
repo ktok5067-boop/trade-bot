@@ -25,6 +25,7 @@ HELP = """Команды:
 /close 1 182 — закрыть сделку №1 по цене 182 (посчитает P&L)
 /stats — ваша статистика сделок (винрейт, итог)
 /paper — бумажный эксперимент: входы/выходы бота и статистика
+/deep — какие бумаги прогнать через глубокий разбор аналитиков
 /backtest — качество прошлых сигналов с учётом комиссии
 /signals — последние сигналы
 /dividends — дивидендные отсечки · /brief — анализ · /status
@@ -32,11 +33,11 @@ HELP = """Команды:
 
 # Кнопки-меню (ReplyKeyboardMarkup) — дублируют главные функции
 MENU_BUTTONS = [
-    ["🎯 Идея", "🏆 Топ 3-4 дня"],
+    ["🎯 Идея", "🔎 Разбор"],
+    ["🏆 Топ 3-4 дня", "🧪 Бумага"],
     ["⚡ Пул", "📊 Сигналы"],
     ["📈 Котировка", "💼 Сделки"],
-    ["🧪 Бумага", "📉 Бэктест"],
-    ["ℹ️ Статус"],
+    ["📉 Бэктест", "ℹ️ Статус"],
 ]
 
 
@@ -47,6 +48,7 @@ def _menu_keyboard() -> dict:
 def _button_to_command(text: str) -> str | None:
     m = {
         "🎯 Идея": "/idea",
+        "🔎 Разбор": "/deep",
         "🏆 Топ 3-4 дня": "/top",
         "⚡ Пул": "/pool",
         "📊 Сигналы": "/signals",
@@ -489,6 +491,23 @@ def handle_update(msg: dict):
         text_out = deliver.paper_summary()
         deliver.send_text(text_out or "🧪 Бумажных данных пока нет — эксперимент начнётся "
                           "в ближайшую торговую сессию.", chat_id)
+
+    elif text.startswith("/deep"):
+        from . import deep_candidates
+        deliver.send_text("🔎 Смотрю, что интересного по всему списку…", chat_id)
+        try:
+            rows = deep_candidates.build_candidates(3)
+            if not rows:
+                deliver.send_text("Сейчас нет бумаг, достойных глубокого разбора.", chat_id)
+                return
+            body = "\n\n".join(deep_candidates._line(r) for r in rows)
+            cmds = "\n".join(f"<code>deep_analysis.bat {r['ticker']}</code>" for r in rows)
+            deliver.send_text(
+                f"🔎 <b>Кандидаты на глубокий разбор</b>\n\n{body}\n\n"
+                f"<b>Запустить разбор (15-30 мин на бумагу):</b>\n{cmds}", chat_id)
+        except Exception as e:
+            log.exception("deep command")
+            deliver.send_text(f"Не получилось: {e}", chat_id)
 
     elif text.startswith("/stats"):
         from . import store
