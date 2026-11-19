@@ -107,6 +107,115 @@ def _poc_buckets(tb: list[dict], n_buckets: int = 15) -> dict:
     return {"buckets": buckets, "poc_idx": poc_idx, "tp_range": (lo, hi)}
 
 
+def volume_profile(bars: list[dict], n_buckets: int = 30,
+                   va_pct: float = 0.70) -> dict | None:
+    """Многодневный Volume Profile: POC + зона стоимости (VAH/VAL).
+
+    В отличие от _poc_buckets (только сегодняшний день), считает по всему
+    окну баров (обычно ~5 календарных дней). VAH/VAL — границы области,
+    где проторговано va_pct (70%) объёма; работают как уровни S/R.
+    """
+    if not bars:
+        return None
+    tps = [(b["high"] + b["low"] + b["close"]) / 3 for b in bars]
+    lo, hi = min(tps), max(tps)
+    if hi <= lo:
+        return None
+    width = (hi - lo) / n_buckets
+    buckets = [{"low": lo + i * width, "high": lo + (i + 1) * width, "vol": 0.0}
+               for i in range(n_buckets)]
+    for b, tp in zip(bars, tps):
+        idx = min(int((tp - lo) / width), n_buckets - 1)
+        buckets[idx]["vol"] += b["volume"]
+    total = sum(x["vol"] for x in buckets)
+    if total <= 0:
+        return None
+    poc_idx = max(range(len(buckets)), key=lambda i: buckets[i]["vol"])
+    # зона стоимости: расширяемся от POC в сторону более «тяжёлого» соседа
+    acc = buckets[poc_idx]["vol"]
+    target = total * va_pct
+    lo_i = hi_i = poc_idx
+    while acc < target and (lo_i > 0 or hi_i < n_buckets - 1):
+        up = buckets[hi_i + 1]["vol"] if hi_i < n_buckets - 1 else -1.0
+        dn = buckets[lo_i - 1]["vol"] if lo_i > 0 else -1.0
+        if up >= dn:
+            hi_i += 1
+            acc += buckets[hi_i]["vol"]
+        else:
+            lo_i -= 1
+            acc += buckets[lo_i]["vol"]
+    poc_b = buckets[poc_idx]
+    days = len({b["ts"][:10] for b in bars})
+    return {
+        "poc": round((poc_b["low"] + poc_b["high"]) / 2, 4),
+        "vah": round(buckets[hi_i]["high"], 4),
+        "val": round(buckets[lo_i]["low"], 4),
+        "days": days,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Свинг-структура (SMC-lite): BOS/CHoCH + свипы ликвидности.
+# ---------------------------------------------------------------------------
+
+def _smc_pivots(values: list[float], kind: str, k: int = 2) -> list[tuple[int, float]]:
+    """Подтверждённые фрактальные свинги (k баров с каждой стороны)."""
+    out = []
+    for i in range(k, len(values) - k):
+        w = values[i - k:i + k + 1]
+        if kind == "high" and values[i] == max(w):
+            out.append((i, values[i]))
+        elif kind == "low" and values[i] == min(w):
+            out.append((i, values[i]))
+    return out
+
+
+def smc_structure(tb: list[dict]) -> dict | None:
+    """Микроструктура дня по 10-мин барам.
+
+    Возвращает {"trend", "break": {dir, choc, level}|None,
+                "sweep": {dir, level}|None, "last_sh", "last_sl"}.
+    trend — по последовательности свингов (HH+HL / LH+LL / range).
+    break — пробой последнего свинга последним баром (BOS по тренду,
+            CHoCH — против тренда). sweep — укол за свинг с возвратом.
+    """
+    if len(tb) < 12:
+        return None
+    highs = [b["high"] for b in tb]
+    lows = [b["low"] for b in tb]
+    closes = [b["close"] for b in tb]
+    k = 2
+    ph = _smc_pivots(highs, "high", k)
+    pl = _smc_pivots(lows, "low", k)
+    if not ph or not pl:
+        return None
+    last_sh = ph[-1][1]
+    last_sl = pl[-1][1]
+    trend = "range"
+    if len(ph) >= 2 and len(pl) >= 2:
+        hh = ph[-1][1] > ph[-2][1]
+        hl = pl[-1][1] > pl[-2][1]
+        if hh and hl:
+            trend = "up"
+        elif not hh and not hl:
+            trend = "down"
+    last, prev = closes[-1], closes[-2]
+    brk = None
+    if ph[-1][0] <= len(tb) - 2 and prev <= last_sh < last:
+        brk = {"dir": "up", "choc": trend == "down", "level": last_sh}
+    elif pl[-1][0] <= len(tb) - 2 and prev >= last_sl > last:
+        brk = {"dir": "down", "choc": trend == "up", "level": last_sl}
+    # свип ликвидности: тень за последний свинг, close вернулся обратно
+    sweep = None
+    b = tb[-1]
+    if pl[-1][0] <= len(tb) - 2 and b["low"] < last_sl <= b["close"]:
+        sweep = {"dir": "low", "level": last_sl}
+    elif ph[-1][0] <= len(tb) - 2 and b["high"] > last_sh >= b["close"]:
+        sweep = {"dir": "high", "level": last_sh}
+    return {"trend": trend, "break": brk, "sweep": sweep,
+            "last_sh": last_sh, "last_sl": last_sl}
+
+
 # ---------------------------------------------------------------------------
 # Уровни поддержки/сопротивления по 3-дневным барам (кластеризация хаёв/лоёв).
 # ---------------------------------------------------------------------------
@@ -222,8 +331,26 @@ def analyze_bars(bars: list[dict]) -> dict | None:
     # кластеры объёма (POC)
     poc = _poc_buckets(tb, int(_cfg("poc_buckets", 15)))
 
-    # уровни S/R по 3 прошлым дням
+    # многодневный Volume Profile (POC + VAH/VAL) по всему окну баров
+    profile = volume_profile(bars, int(_cfg("profile_buckets", 30)),
+                             float(_cfg("va_pct", 0.70)))
+
+    # уровни S/R по 3 прошлым дням + подмешиваем VAH/VAL многодневного профиля
     levels = compute_levels(bars)
+    if profile:
+        vah, val = profile["vah"], profile["val"]
+        if val <= last and val not in levels["support"]:
+            levels["support"] = sorted(levels["support"] + [val])
+            levels["nearest_support"] = max(
+                [l for l in levels["support"] if l <= last], default=None)
+        if vah >= last and vah not in levels["resistance"]:
+            levels["resistance"] = sorted(levels["resistance"] + [vah])
+            levels["nearest_resistance"] = min(
+                [r for r in levels["resistance"] if r >= last], default=None)
+
+    # интрадей-дивергенции RSI/MACD по 10-мин свингам
+    from . import indicators as _ind
+    intraday_divs = _ind.detect_divergences(highs, lows, closes, k=2)
 
     return {
         "last": last, "vwap": vwap, "sma5": sma5, "sma20": sma20,
@@ -231,7 +358,8 @@ def analyze_bars(bars: list[dict]) -> dict | None:
         "day_high": hi, "day_low": lo, "range_pos": rng_pos,
         "chg_day": chg_day, "move_15m": move_15m, "move_30m": move_30m,
         "delta_ratio": delta_ratio_5, "delta_ratio_3": delta_ratio_3,
-        "poc": poc, "levels": levels,
+        "poc": poc, "levels": levels, "profile": profile,
+        "divergences": intraday_divs,
         "avg_vol": round(avg_vol, 4),
         "_tb": tb,          # сегодняшние бары (для смарт-мани эвристик)
         "bars": len(tb),
@@ -403,6 +531,45 @@ def detect_events(secid: str, ind: dict) -> list[dict]:
                            "vol": round(b["volume"] / avg_vol, 1),
                            "power": vol_mult * 1.5})
 
+    # 9. Интрадей-дивергенции RSI/MACD по 10-мин свингам
+    for d in ind.get("divergences") or []:
+        kind = d["kind"]
+        bull = "BULL" in kind
+        events.append({"type": kind, "move": m15, "vol": round(vol_ratio, 1),
+                       "text": d["text"], "power": vol_mult * 1.5 if bull else vol_mult * 1.5})
+
+    # 10. Свинг-структура (SMC-lite): BOS/CHoCH + свипы ликвидности
+    if tb:
+        smc = smc_structure(tb)
+        if smc:
+            brk = smc.get("break")
+            if brk:
+                if brk["choc"]:
+                    t = "CHOC_UP" if brk["dir"] == "up" else "CHOC_DOWN"
+                else:
+                    t = "BOS_UP" if brk["dir"] == "up" else "BOS_DOWN"
+                events.append({"type": t, "move": m15, "vol": round(vol_ratio, 1),
+                               "level": round(brk["level"], 4),
+                               "smc_trend": smc["trend"], "power": vol_mult * 2})
+            sw = smc.get("sweep")
+            if sw:
+                t = "SWEEP_LOW" if sw["dir"] == "low" else "SWEEP_HIGH"
+                events.append({"type": t, "move": m15, "vol": round(vol_ratio, 1),
+                               "level": round(sw["level"], 4),
+                               "power": vol_mult * 1.8})
+
+    # 11. Пробой границ зоны стоимости многодневного профиля (VAH/VAL)
+    prof = ind.get("profile")
+    if prof and len(tb) >= 2:
+        vah, val = prof["vah"], prof["val"]
+        c1, c2 = tb[-2]["close"], tb[-1]["close"]
+        if c1 <= vah < c2:
+            events.append({"type": "VA_BREAK_UP", "move": m15, "vol": round(vol_ratio, 1),
+                           "level": vah, "power": vol_mult * 2})
+        elif c1 >= val > c2:
+            events.append({"type": "VA_BREAK_DOWN", "move": m15, "vol": round(vol_ratio, 1),
+                           "level": val, "power": vol_mult * 2})
+
     events.sort(key=lambda e: -e["power"])
     return events
 
@@ -421,6 +588,18 @@ RUS = {
     "DELTA_DIV_NEG": "🫥 ВОЗМОЖНАЯ ПРОДАЖА (эвристика по закрытиям свечей)",
     "VOL_NODE": "📦 ПРОБОЙ ОБЪЁМНОГО УЗЛА (POC)",
     "LEVEL_TEST": "🧱 ТЕСТ УРОВНЯ С ПОГЛОЩЕНИЕМ",
+    "RSI_BULL_DIV": "🔄 БЫЧЬЯ ДИВЕРГЕНЦИЯ RSI (интрадей)",
+    "RSI_BEAR_DIV": "🔄 МЕВЕЖЬЯ ДИВЕРГЕНЦИЯ RSI (интрадей)",
+    "MACD_BULL_DIV": "🔄 БЫЧЬЯ ДИВЕРГЕНЦИЯ MACD (интрадей)",
+    "MACD_BEAR_DIV": "🔄 МЕВЕЖЬЯ ДИВЕРГЕНЦИЯ MACD (интрадей)",
+    "BOS_UP": "🏗 ПРОБОЙ СТРУКТУРЫ ВВЕРХ (BOS)",
+    "BOS_DOWN": "🏗 ПРОБОЙ СТРУКТУРЫ ВНИЗ (BOS)",
+    "CHOC_UP": "🔀 РАЗВОРОТ СТРУКТУРЫ ВВЕРХ (CHoCH)",
+    "CHOC_DOWN": "🔀 РАЗВОРОТ СТРУКТУРЫ ВНИЗ (CHoCH)",
+    "SWEEP_LOW": "🪤 СВИП ЛИКВИДНОСТИ ПОД ЛОЯМИ",
+    "SWEEP_HIGH": "🪤 СВИП ЛИКВИДНОСТИ НАД ХАЯМИ",
+    "VA_BREAK_UP": "📈 ПРОБОЙ ВЕРХНЕЙ ГРАНИЦЫ ЗОНЫ СТОИМОСТИ (VAH)",
+    "VA_BREAK_DOWN": "📉 ПРОБОЙ НИЖНЕЙ ГРАНИЦЫ ЗОНЫ СТОИМОСТИ (VAL)",
 }
 
 
@@ -497,6 +676,28 @@ def _idea(secid: str, ev: dict, ind: dict) -> str:
         return (f"тень за поддержку {ev.get('level')} с возвратом close обратно и объёмом — "
                 f"тест уровня с поглощением. Спот: удержание уровня — отскок; пробой с "
                 f"закреплением — импульс.")
+    if ev["type"].endswith("_DIV"):
+        return f"{ev.get('text', 'дивергенция')}. Спот: сигнал ранний — ждать подтверждающий бар, стоп под {stop_s}."
+    if ev["type"] in ("BOS_UP", "CHOC_UP"):
+        what = "разворот структуры вверх (CHoCH)" if ev["type"] == "CHOC_UP" else "продолжение структуры вверх (BOS)"
+        return (f"закрытие над свинг-хаем {ev.get('level')} — {what}. "
+                f"Спот: вход на откате к VWAP {format(vwap, '.4g') if vwap else '—'}₽, стоп под {stop_s}.")
+    if ev["type"] in ("BOS_DOWN", "CHOC_DOWN"):
+        what = "разворот структуры вниз (CHoCH)" if ev["type"] == "CHOC_DOWN" else "продолжение структуры вниз (BOS)"
+        return (f"закрытие под свинг-лоу {ev.get('level')} — {what}. "
+                f"Спот: против лонга; интерес к покупке — только после возврата выше VWAP.")
+    if ev["type"] == "SWEEP_LOW":
+        return (f"укол под свинг-лоу {ev.get('level')} с возвратом close выше — сняли ликвидность. "
+                f"Спот: частый предвестник разворота вверх; стоп под {stop_s}.")
+    if ev["type"] == "SWEEP_HIGH":
+        return (f"укол над свинг-хаем {ev.get('level')} с возвратом close ниже — сняли ликвидность. "
+                f"Спот: против лонга, возможен откат к VWAP {format(vwap, '.4g') if vwap else '—'}₽.")
+    if ev["type"] == "VA_BREAK_UP":
+        return (f"цена закрепилась над VAH {ev.get('level')} многодневного профиля — выход из зоны стоимости вверх. "
+                f"Спот: удержание над VAH — импульс; стоп под {stop_s}.")
+    if ev["type"] == "VA_BREAK_DOWN":
+        return (f"цена ушла под VAL {ev.get('level')} многодневного профиля — выход из зоны стоимости вниз. "
+                f"Спот: против лонга; возврат в зону (над VAL) — сигнал осторожности снят.")
     return "наблюдаем."
 
 
@@ -536,7 +737,9 @@ def summary_line(secid: str, ind: dict) -> str:
     """Однострочная сводка для /quote и брифингов."""
     vw = f", VWAP {ind['vwap']:.4g}" if ind["vwap"] else ""
     rp = f", {ind['range_pos']}% диапазона дня" if ind["range_pos"] is not None else ""
-    return (f"{secid}: {ind['last']:.4g}₽ за день {ind['chg_day']:+.2f}%{vw}{rp}, "
+    prof = ind.get("profile")
+    pf = f", VA {prof['val']:.4g}–{prof['vah']:.4g}" if prof else ""
+    return (f"{secid}: {ind['last']:.4g}₽ за день {ind['chg_day']:+.2f}%{vw}{rp}{pf}, "
             f"15м {ind['move_15m']:+.2f}%, объём x{ind['vol_ratio']}, RSI(10м) {ind['rsi14']}")
 
 
@@ -608,6 +811,42 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None,
                 score += 0.5
                 reasons.append("дневной RSI <35 — перепроданность (+0.5)")
                 confirmations.add("trend")
+        # ADX: сила дневного тренда — фильтр «тренд vs флэт»
+        adx = daily_ind.get("adx14")
+        if adx is not None:
+            if adx < 20:
+                score -= 0.5
+                reasons.append(f"ADX {adx} <20 — на дневке флэт, пробои рискованны (−0.5)")
+            elif adx >= 25 and tr in ("восходящий", "умеренно-восходящий"):
+                score += 0.5
+                reasons.append(f"ADX {adx} ≥25 — дневной тренд реальный (+0.5)")
+        # Supertrend (дневной)
+        st_dir = daily_ind.get("supertrend_dir")
+        if st_dir == 1:
+            score += 0.5
+            reasons.append("Supertrend бычий на дневке (+0.5)")
+            confirmations.add("supertrend")
+        elif st_dir == -1:
+            score -= 0.5
+            reasons.append("Supertrend медвежий на дневке (−0.5)")
+        # OBV-дивергенция (дневная)
+        obv_div = daily_ind.get("obv_div")
+        if obv_div == "bull":
+            score += 0.5
+            reasons.append("OBV-дивергенция: скрытая покупка на дневке (+0.5)")
+            confirmations.add("obv")
+        elif obv_div == "bear":
+            score -= 0.5
+            reasons.append("OBV-дивергенция: скрытая продажа на дневке (−0.5)")
+        # Дневные дивергенции RSI/MACD по свингам
+        for d in daily_ind.get("divergences") or []:
+            if "BULL" in d["kind"]:
+                score += 1.0
+                reasons.append(f"{d['text']} (+1)")
+                confirmations.add("divergence")
+            else:
+                score -= 1.0
+                reasons.append(f"{d['text']} (−1)")
 
     # 2. Позиция относительно VWAP
     if vwap:
@@ -684,9 +923,48 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None,
                 reasons.append("тест уровня — направление неясно (0)")
         elif t == "ABSORPTION":
             reasons.append("объём без движения — набор или раздача, не подтверждение (0)")
+        elif t in ("BOS_UP", "CHOC_UP"):
+            score += 1.0
+            reasons.append(f"{'разворот' if t == 'CHOC_UP' else 'продолжение'} структуры вверх (+1)")
+            confirmations.add("structure")
+        elif t in ("BOS_DOWN", "CHOC_DOWN"):
+            score -= 1.0
+            reasons.append(f"{'разворот' if t == 'CHOC_DOWN' else 'продолжение'} структуры вниз — против лонга (−1)")
+        elif t == "SWEEP_LOW":
+            score += 0.5
+            reasons.append("свип ликвидности под лоями с возвратом (+0.5)")
+            confirmations.add("structure")
+        elif t == "SWEEP_HIGH":
+            score -= 0.5
+            reasons.append("свип ликвидности над хаями с возвратом — против лонга (−0.5)")
+        elif t == "VA_BREAK_UP":
+            score += 1.0
+            reasons.append("пробой VAH многодневного профиля вверх (+1)")
+            confirmations.add("profile")
+        elif t == "VA_BREAK_DOWN":
+            score -= 1.0
+            reasons.append("пробой VAL многодневного профиля вниз — против лонга (−1)")
+        elif t in ("RSI_BULL_DIV", "MACD_BULL_DIV"):
+            score += 1.0
+            reasons.append("бычья интрадей-дивергенция (+1)")
+            confirmations.add("divergence")
+        elif t in ("RSI_BEAR_DIV", "MACD_BEAR_DIV"):
+            score -= 1.0
+            reasons.append("медвежья интрадей-дивергенция — против лонга (−1)")
         elif t in neg_ev:
             score -= 1.0
             reasons.append(f"{RUS.get(t, t)} — против лонга (−1)")
+
+    # 5b. Положение относительно зоны стоимости многодневного профиля
+    profile = ind.get("profile")
+    if profile:
+        if last > profile["vah"]:
+            score += 0.5
+            reasons.append("цена выше VAH многодневного профиля — сильнее рынка (+0.5)")
+            confirmations.add("profile")
+        elif last < profile["val"]:
+            score -= 0.5
+            reasons.append("цена ниже VAL многодневного профиля — слабее рынка (−0.5)")
 
     # 6. Участие объёма
     vol = ind.get("vol_ratio")
