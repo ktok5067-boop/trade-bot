@@ -15,7 +15,7 @@ import urllib.request
 import zoneinfo
 from datetime import datetime, timedelta, timezone
 
-from . import analyze, bot, db, deliver, fetch_quotes, fetch_news, llm
+from . import analyze, bot, db, deliver, fetch_quotes, fetch_news, llm, store
 from .settings import (CONFIG, HEALTHCHECK_URL, LOCAL_TZ, MSK,
                        TELEGRAM_BOT_TOKEN, setup_logging)
 
@@ -536,6 +536,16 @@ def run_cycle():
     cfg = CONFIG["schedule"]
     now = now_local()
     ran = False
+
+    # Бот выключен владельцем (/off): никакую автоматику не гоняем — ни сканов,
+    # ни алертов, ни бумажной торговли, ни брифингов. Но поддерживаем редкий
+    # heartbeat, чтобы платформа не считала процесс мёртвым. Опрос Telegram живёт
+    # в отдельном потоке, поэтому команды (включая /on) продолжают работать.
+    if not store.bot_enabled():
+        if minutes_since("last_pause_ping") >= 5:
+            touch("last_pause_ping")
+            healthcheck_ping()
+        return False
 
     # --- новости (24/7) ---
     if minutes_since("last_news") >= cfg["news_interval_min"]:

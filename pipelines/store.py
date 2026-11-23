@@ -546,3 +546,15 @@ def set_meta(key: str, value: str):
     else:
         _exec("INSERT INTO meta_persist(key, value) VALUES(?, ?) "
               "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+
+# Глобальный переключатель бота. Хранится в постоянной базе (meta_persist),
+# поэтому «выключено» переживает рестарт/передеплой на Render.
+# False = вся автоматика на паузе (сканы, алерты, бумажная торговля, брифинги),
+# но Telegram-бот продолжает отвечать на команды, чтобы можно было включить обратно.
+def bot_enabled() -> bool:
+    return get_meta("bot_enabled", "1") != "0"
+
+
+def set_bot_enabled(on: bool):
+    set_meta("bot_enabled", "1" if on else "0")

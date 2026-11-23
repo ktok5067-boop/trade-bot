@@ -29,6 +29,7 @@ HELP = """Команды:
 /backtest — качество прошлых сигналов с учётом комиссии
 /signals — последние сигналы
 /dividends — дивидендные отсечки · /brief — анализ · /status
+/off — выключить автоматику (бот на паузе) · /on — включить обратно
 Голосовое сообщение или просто текст — задайте вопрос."""
 
 # Кнопки-меню (ReplyKeyboardMarkup) — дублируют главные функции
@@ -237,6 +238,11 @@ def handle_update(msg: dict):
         return
     _meta_set("tg_last_chat_id", str(chat_id))
 
+    # store используется ниже (переключатель /on-/off, /status), но в этой же
+    # функции есть локальные `from . import store` — привязываем имя сразу,
+    # иначе Python сочтёт его локальным и более ранние обращения упадут.
+    from . import store
+
     if "voice" in msg or "audio" in msg:
         fid = msg.get("voice", msg.get("audio", {}))["file_id"]
         if not GROQ_API_KEY:
@@ -265,12 +271,33 @@ def handle_update(msg: dict):
         if text == "/quote":
             text = "/quote"  # без аргумента — спросим в идее ниже
 
+    # Глобальный переключатель бота. Обрабатываем самым первым, чтобы /on
+    # сработал всегда, даже когда бот выключен. Только для владельца (auth выше).
+    cmd = (text.split()[0].lower() if text.split() else "")
+    if cmd in ("/off", "/stop", "/pause", "/выкл", "/выключить", "/пауза"):
+        store.set_bot_enabled(False)
+        _meta_set("bot_enabled_changed", f"off {_utc_now()}")
+        deliver.send_text(
+            "⏸ Бот ВЫКЛЮЧЕН. Автоматика на паузе: сканы, алерты, бумажная "
+            "торговля, брифинги и пинги не работают.\n"
+            "Я по-прежнему отвечаю на команды вручную (например /quote, /idea).\n"
+            "Чтобы включить обратно — /on.", chat_id)
+        return
+    if cmd in ("/on", "/resume", "/вкл", "/включить", "/запустить"):
+        store.set_bot_enabled(True)
+        _meta_set("bot_enabled_changed", f"on {_utc_now()}")
+        deliver.send_text(
+            "▶️ Бот ВКЛЮЧЁН. Автоматика возобновлена: сканы, алерты, бумажная "
+            "торговля, брифинги и пинги снова работают.", chat_id)
+        return
+
     if text.startswith("/start") or text.startswith("/help"):
         deliver.send_text(HELP, chat_id, reply_markup=_menu_keyboard())
     elif text.startswith("/status"):
         n = len(db.recent_news(hours=24, limit=1000))
         s = len(db.signals_since(hours=24))
-        deliver.send_text(f"Состояние:\n• новостей за 24ч: {n}\n• сигналов за 24ч: {s}\n"
+        state = "▶️ работает" if store.bot_enabled() else "⏸ ВЫКЛЮЧЕН (автоматика на паузе, /on — включить)"
+        deliver.send_text(f"Состояние: {state}\n• новостей за 24ч: {n}\n• сигналов за 24ч: {s}\n"
                           f"• {llm.usage_report()}\n"
                           f"• DeepSeek: {'✅' if DEEPSEEK_API_KEY else '❌ нет ключа'}\n"
                           f"• Groq (голос): {'✅' if GROQ_API_KEY else '❌ нет ключа'}\n"
