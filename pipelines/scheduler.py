@@ -320,6 +320,41 @@ def effective_stop(p: dict, last: float) -> tuple[float, float]:
     return stop, peak
 
 
+def _paper_drawdown_pct(max_open: int = 5) -> float:
+    """Просадка капитала по закрытым бумажным сделкам.
+
+    Считается как кривая капитала при равных долях: каждая сделка рискует
+    1/max_open капитала, поэтому pnl% переводится в изменение эквити.
+    Сумма процентов по сделкам для этого не годится (14 сделок по −4%
+    давали «просадку 54%» — арифметика, не капитал).
+    """
+    from . import store
+    try:
+        rows = store.list_trades(60, mode="paper")
+    except Exception:
+        return 0.0
+    eq = peak = 1.0
+    dd = 0.0
+    n = 0
+    for t in rows:
+        entry, exitp = t.get("entry_price"), t.get("exit_price")
+        if entry is None or exitp is None:
+            continue
+        try:
+            entry, exitp = float(entry), float(exitp)
+        except (TypeError, ValueError):
+            continue
+        if entry <= 0:
+            continue
+        fee = float(t.get("fee_pct") or 0)
+        pnl = (exitp / entry - 1) * 100 - fee
+        eq *= 1 + pnl / 100 / max(1, max_open)
+        peak = max(peak, eq)
+        dd = max(dd, (peak - eq) / peak * 100)
+        n += 1
+    return round(dd, 2) if n >= 8 else 0.0
+
+
 def check_positions():
     """Мониторинг активных позиций: цель/стоп/время. Цены обновляем ПЕРЕД проверкой."""
     from . import store
@@ -475,9 +510,9 @@ def paper_trading():
     try:
         active = store.active_positions(mode="paper")
         open_pos = {p["ticker"] for p in active}
-        # Kill-switch: стратегия уже показала просадку хуже порога — стоп новым входам.
-        dd = float((store.trade_stats(days=30, mode="paper") or {}).get("max_drawdown_pct") or 0)
-        dd_limit = float(cfg.get("kill_switch_dd_pct", 12.0))
+        # Kill-switch: реальная просадка капитала хуже порога — стоп новым входам.
+        dd = _paper_drawdown_pct(int(cfg.get("paper_max_open", 5)))
+        dd_limit = float(cfg.get("kill_switch_dd_pct", 15.0))
         if dd >= dd_limit:
             _dbg(f"KILL-SWITCH: просадка {dd}% ≥ {dd_limit}% — новые входы остановлены")
             log.warning("paper: kill-switch сработал, просадка %s%% ≥ %s%%", dd, dd_limit)
