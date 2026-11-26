@@ -1,4 +1,4 @@
-r"""Walk-forward бэктест сигналов бота на истории MOEX.
+﻿r"""Walk-forward бэктест сигналов бота на истории MOEX.
 
 Задача — не «показать красивую кривую», а ответить на один вопрос:
 различает ли текущий скоринг хорошие входы от плохих. Поэтому прогоняются
@@ -167,10 +167,72 @@ EXIT_POLICIES: dict[str, dict] = {
 }
 
 
+def _simulate_short(bars: list[dict], i: int, stop_frac: float, target_frac: float,
+                    max_hold_days: int, atr_abs: float = 0.0,
+                    policy: dict | None = None, cost_pct: float = 0.0,
+                    borrow_pct_day: float = 0.0) -> dict | None:
+    """Шорт: зеркально лонгу, но гэп вверх через стоп исполняется по открытию.
+
+    Плата за заём бумаг начисляется за каждый торговый день удержания —
+    она вычитается из результата отдельной строкой (borrow_pct).
+    """
+    policy = policy or {}
+    if i + 1 >= len(bars):
+        return None
+    entry_bar = bars[i + 1]
+    entry = float(entry_bar["open"] or entry_bar["close"])
+    if not entry:
+        return None
+    initial_stop = entry * (1 + stop_frac)
+    stop = initial_stop
+    target = entry * (1 - target_frac)
+    be_atr = float(policy.get("be_atr") or 0.0)
+    trail_atr = float(policy.get("trail_atr") or 0.0)
+    hold_limit = int(policy.get("time_days") or max_hold_days)
+    breakeven = entry * (1 - cost_pct / 100.0)
+    cur_day = _day(entry_bar["ts"])
+    days_seen = 0
+    last_close = entry
+    min_low = entry
+
+    def out(px: float, reason: str, days: int, ts: str) -> dict:
+        borrow = borrow_pct_day * max(0, days + 1)
+        return {"entry": entry, "exit": px, "reason": reason,
+                "hold_days": days, "exit_ts": ts, "borrow_pct": round(borrow, 3)}
+
+    for j in range(i + 1, len(bars)):
+        b = bars[j]
+        d = _day(b["ts"])
+        if d != cur_day:
+            cur_day = d
+            days_seen += 1
+            if days_seen > hold_limit:
+                return out(last_close, "time", days_seen - 1, bars[j - 1]["ts"])
+        hi, lo = float(b["high"]), float(b["low"])
+        # стоп (рост цены) раньше цели — консервативно; гэп вверх = открытие
+        if hi >= stop:
+            fill = stop
+            op = float(b["open"] or stop)
+            if op > stop:
+                fill = op
+            return out(fill, "trail" if stop < initial_stop else "stop",
+                       days_seen, b["ts"])
+        if lo <= target:
+            return out(target, "target", days_seen, b["ts"])
+        last_close = float(b["close"])
+        min_low = min(min_low, lo)
+        if be_atr and atr_abs and min_low <= entry - be_atr * atr_abs:
+            stop = min(stop, breakeven)
+        if trail_atr and atr_abs:
+            stop = min(stop, min_low + trail_atr * atr_abs)
+    return out(last_close, "eod", days_seen, bars[-1]["ts"])
+
+
 def run(days: int = 200, tickers: list[str] | None = None,
         eval_every: int | None = None, cost_override: float | None = None,
         min_turnover: float | None = None,
-        policies: dict[str, dict] | None = None) -> dict:
+        policies: dict[str, dict] | None = None,
+        side: str = "long", borrow_pct_day: float | None = None) -> dict:
     cfg = CONFIG.get("intraday") or {}
     fee = float(cost_override if cost_override is not None else cfg.get("fee_pct", 0.15))
     slip = float(cfg.get("slip_pct", 0.05))
@@ -183,6 +245,14 @@ def run(days: int = 200, tickers: list[str] | None = None,
     min_turn = float(min_turnover if min_turnover is not None
                      else cfg.get("min_turnover_rub", 0) or 0)
     pols = policies or EXIT_POLICIES
+    enter_score = float(cfg.get("enter_score", 2.0))
+    min_net = float(cfg.get("min_net_pct", 1.0))
+    min_rr = float(cfg.get("min_rr", 1.2))
+    borrow = float(borrow_pct_day if borrow_pct_day is not None
+                   else cfg.get("short_borrow_pct_day", 0.05))
+    if side == "short":
+        log.info("шорт: зеркальный сигнал (балл ≤ −%.1f), заём %.3f%%/день",
+                 enter_score, borrow)
 
     tickers = tickers or [w["ticker"] for w in CONFIG["watchlist"]]
     idx = _IdxSeries(history.load("IMOEX", 10), history.load("IMOEX", 24))
@@ -238,29 +308,55 @@ def run(days: int = 200, tickers: list[str] | None = None,
                 entry_px = float(v["entry"])
                 stop_frac = max(0.005, (entry_px - float(v["stop"])) / entry_px)
                 target_frac = max(stop_frac, (float(v["target"]) - entry_px) / entry_px)
-                sim = _simulate(bars, i, stop_frac, target_frac, max_hold,
-                                atr_abs=atr, cost_pct=cost)
-                if not sim:
-                    continue
-                pnl = _pct(sim["exit"], sim["entry"]) - cost
+                is_short = side == "short"
+                if is_short:
+                    # Шорт входим на зеркальном сигнале: балл настолько же
+                    # отрицательный, насколько лонговый вход положителен.
+                    fee_blocked = (float(v.get("net_pct") or 0) < min_net
+                                   or float(v.get("net_rr") or 0) < min_rr)
+                    if not (float(v["score"]) <= -enter_score and not fee_blocked):
+                        continue
+                    sim = _simulate_short(bars, i, stop_frac, target_frac, max_hold,
+                                          atr_abs=atr, cost_pct=cost,
+                                          borrow_pct_day=borrow)
+                    if not sim:
+                        continue
+                    pnl = -_pct(sim["exit"], sim["entry"]) - cost - sim["borrow_pct"]
+                else:
+                    sim = _simulate(bars, i, stop_frac, target_frac, max_hold,
+                                    atr_abs=atr, cost_pct=cost)
+                    if not sim:
+                        continue
+                    pnl = _pct(sim["exit"], sim["entry"]) - cost
                 # варианты выхода считаем только для входов — это они интересуют
                 alt: dict[str, float] = {}
-                if v["call"] == "enter":
+                entered = (float(v["score"]) <= -enter_score) if is_short else (v["call"] == "enter")
+                if entered:
                     for pname, pol in pols.items():
                         if pname == "base":
                             continue
-                        s2 = _simulate(bars, i, stop_frac, target_frac, max_hold,
-                                       atr_abs=atr, policy=pol, cost_pct=cost)
-                        if s2:
-                            alt[pname] = round(_pct(s2["exit"], s2["entry"]) - cost, 2)
+                        if is_short:
+                            s2 = _simulate_short(bars, i, stop_frac, target_frac, max_hold,
+                                                 atr_abs=atr, policy=pol, cost_pct=cost,
+                                                 borrow_pct_day=borrow)
+                            if s2:
+                                alt[pname] = round(-_pct(s2["exit"], s2["entry"])
+                                                   - cost - s2["borrow_pct"], 2)
+                        else:
+                            s2 = _simulate(bars, i, stop_frac, target_frac, max_hold,
+                                           atr_abs=atr, policy=pol, cost_pct=cost)
+                            if s2:
+                                alt[pname] = round(_pct(s2["exit"], s2["entry"]) - cost, 2)
                     alt["base"] = round(pnl, 2)
-                # альфа к IMOEX за период удержания
+                # альфа к IMOEX за период удержания (для шорта знак беты обратный)
                 ie, ix = idx_ctx, idx.ctx(sim["exit_ts"])
                 alpha = None
                 if ie.get("value") and ix.get("value"):
-                    alpha = round(pnl - _pct(ix["value"], ie["value"]), 2)
+                    idx_ret = _pct(ix["value"], ie["value"])
+                    alpha = round(pnl + idx_ret if is_short else pnl - idx_ret, 2)
                 rows.append({
                     "date": day, "time": bars[i]["ts"][11:16], "ticker": ticker,
+                    "side": side, "entered": bool(entered),
                     "call": v["call"], "score": v["score"],
                     "nconf": len(v.get("confirmations") or []),
                     "price": round(entry_px, 4), "stop": round(float(v["stop"]), 4),
@@ -280,7 +376,8 @@ def run(days: int = 200, tickers: list[str] | None = None,
                  sum(1 for r in rows if r["ticker"] == ticker))
     return {"rows": rows, "cost": cost, "fee": fee, "slip": slip,
             "stop_mult": stop_mult, "target_mult": target_mult, "max_hold": max_hold,
-            "min_turn": min_turn, "skipped_illiquid": skipped_illiquid}
+            "min_turn": min_turn, "skipped_illiquid": skipped_illiquid,
+            "side": side, "borrow": borrow}
 
 
 def _mean_t(xs: list[float]) -> tuple[float, float | None, float]:
@@ -372,7 +469,7 @@ def report(res: dict) -> str:
     add("\n## Только входы: первая и вторая половина периода\n")
     add("| период | n | win% | avg pnl% | t-stat | сумма% | alpha% |")
     add("|---|---|---|---|---|---|---|")
-    enters = [r for r in rows if r["call"] == "enter"]
+    enters = [r for r in rows if r.get("entered", r["call"] == "enter")]
     for name, sub in (("H1", [r for r in enters if r["date"] < mid]),
                       ("H2", [r for r in enters if r["date"] >= mid])):
         s = _stats(sub)
@@ -469,11 +566,11 @@ def features_run(days: int = 730, tickers: list[str] | None = None,
     return out, keys, res
 
 
-def write_signals_csv(res: dict):
+def write_signals_csv(res: dict, suffix: str = ""):
     """Сырые сигналы в CSV (для ручного анализа в Excel)."""
     if not res["rows"]:
         return
-    out = DATA_DIR / "backtest_signals.csv"
+    out = DATA_DIR / f"backtest_signals{suffix}.csv"
     fields = ["date", "time", "ticker", "call", "score", "nconf", "price", "stop",
               "target", "exit", "reason", "hold_days", "pnl_pct", "alpha_pct",
               "cost_pct", "net_pct", "net_rr", "rsi", "vol_ratio", "rng_pos",
@@ -486,10 +583,12 @@ def write_signals_csv(res: dict):
 
 
 def emit(res: dict) -> str:
-    """Записать отчёт + CSV и вернуть текст отчёта."""
+    """Записать отчёт + CSV и вернуть текст отчёта (файлы различаются по стороне)."""
+    side = res.get("side") or "long"
+    suffix = "" if side == "long" else f"_{side}"
     text = report(res)
-    (DATA_DIR / "backtest_report.md").write_text(text, encoding="utf-8")
-    write_signals_csv(res)
+    (DATA_DIR / f"backtest_report{suffix}.md").write_text(text, encoding="utf-8")
+    write_signals_csv(res, suffix)
     return text
 
 
@@ -501,6 +600,10 @@ def main() -> int:
     ap.add_argument("--every", type=int, default=None, help="шаг оценки в барах")
     ap.add_argument("--min-turnover", type=float, default=None,
                     help="фильтр ликвидности: средний дневной оборот, руб")
+    ap.add_argument("--side", default="long", choices=["long", "short"],
+                    help="сторона: long (обычный) или short (зеркальный сигнал)")
+    ap.add_argument("--borrow", type=float, default=None,
+                    help="плата за заём бумаг, %% в день (для шорта)")
     ap.add_argument("--features", action="store_true",
                     help="собрать таблицу фич для калибровки весов")
     args = ap.parse_args()
@@ -515,9 +618,12 @@ def main() -> int:
         print(f"features: {path} ({len(keys)} компонентов)")
         return 0
     res = run(days=args.days, tickers=tickers, eval_every=args.every,
-              cost_override=args.cost, min_turnover=args.min_turnover)
+              cost_override=args.cost, min_turnover=args.min_turnover,
+              side=args.side, borrow_pct_day=args.borrow)
     print(emit(res))
-    print(f"\nотчёты: {DATA_DIR / 'backtest_report.md'}  |  {DATA_DIR / 'backtest_signals.csv'}")
+    suffix = "" if res.get("side") == "long" else f"_{res.get('side')}"
+    print(f"\nотчёты: {DATA_DIR / f'backtest_report{suffix}.md'}"
+          f"  |  {DATA_DIR / f'backtest_signals{suffix}.csv'}")
     return 0
 
 
