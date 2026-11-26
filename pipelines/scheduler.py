@@ -291,6 +291,35 @@ def _trading_days_since(created_at) -> int:
     return n
 
 
+def _cost_pct() -> float:
+    """Полные издержки на сделку: комиссия + проскальзывание в обе стороны."""
+    cfg = CONFIG.get("intraday") or {}
+    return float(cfg.get("fee_pct", 0.15)) + 2 * float(cfg.get("slip_pct", 0.05))
+
+
+def effective_stop(p: dict, last: float) -> tuple[float, float]:
+    """Стоп позиции с учётом безубытка и трейлинга (по конфигу).
+
+    Возвращает (стоп, новый peak). Логика зеркалит бэктест (backtest._simulate):
+      exit_be_atr    — перевести стоп в безубыток после хода на N ATR;
+      exit_trail_atr — трейлинг на N ATR ниже максимума с момента входа.
+    Оба по нулю (по умолчанию) — возвращается исходный стоп.
+    """
+    cfg = CONFIG.get("intraday") or {}
+    entry = float(p["entry_price"])
+    stop = float(p["stop"] or 0)
+    peak = max(float(p.get("peak") or 0), float(last), entry)
+    atr = float(p.get("atr") or 0)
+    if atr > 0:
+        be_atr = float(cfg.get("exit_be_atr", 0) or 0)
+        trail_atr = float(cfg.get("exit_trail_atr", 0) or 0)
+        if be_atr and peak >= entry + be_atr * atr:
+            stop = max(stop, entry * (1 + _cost_pct() / 100))
+        if trail_atr:
+            stop = max(stop, peak - trail_atr * atr)
+    return stop, peak
+
+
 def check_positions():
     """Мониторинг активных позиций: цель/стоп/время. Цены обновляем ПЕРЕД проверкой."""
     from . import store
@@ -327,12 +356,20 @@ def check_positions():
             log.warning("positions %s: котировка устарела (%s) — пропуск", ticker, q.get("ts"))
             continue
         last = float(q["last"])
-        stop = float(p["stop"])
+        base_stop = float(p["stop"])
         target = float(p["target"])
         mode = p.get("mode") or "real"
+        # безубыток/трейлинг: стоп может подняться выше исходного
+        stop, peak = effective_stop(p, last)
+        if stop > base_stop + 1e-9 or peak > float(p.get("peak") or 0) + 1e-9:
+            try:
+                store.update_position_trail(p["id"], stop, peak)
+            except Exception as e:
+                log.warning("trail %s: %s", ticker, e)
         if last <= stop:
+            reason = "trail" if stop > base_stop + 1e-9 else "stop"
             if mode == "paper":
-                _paper_close(p, last, "stop", idx_exit)
+                _paper_close(p, last, reason, idx_exit)
             else:
                 deliver.send_text(
                     f"🛑 <b>СТОП пробит</b> — {ticker}\n"
@@ -380,6 +417,22 @@ def _paper_entries_key() -> str:
     return f"paper_entries_{now_local().strftime('%Y-%m-%d')}"
 
 
+def _sector_of(ticker: str) -> str:
+    """Группа бумаги по config.sectors (для лимита концентрации)."""
+    for sector, members in (CONFIG.get("sectors") or {}).items():
+        if ticker in members:
+            return sector
+    return "other"
+
+
+def _sector_counts(positions: list[dict]) -> dict:
+    counts: dict = {}
+    for p in positions:
+        s = _sector_of(p["ticker"])
+        counts[s] = counts.get(s, 0) + 1
+    return counts
+
+
 def paper_entries_today() -> int:
     raw = db.get_meta(_paper_entries_key())
     try:
@@ -422,6 +475,15 @@ def paper_trading():
     try:
         active = store.active_positions(mode="paper")
         open_pos = {p["ticker"] for p in active}
+        # Kill-switch: стратегия уже показала просадку хуже порога — стоп новым входам.
+        dd = float((store.trade_stats(days=30, mode="paper") or {}).get("max_drawdown_pct") or 0)
+        dd_limit = float(cfg.get("kill_switch_dd_pct", 12.0))
+        if dd >= dd_limit:
+            _dbg(f"KILL-SWITCH: просадка {dd}% ≥ {dd_limit}% — новые входы остановлены")
+            log.warning("paper: kill-switch сработал, просадка %s%% ≥ %s%%", dd, dd_limit)
+            return
+        max_sector = int(cfg.get("max_per_sector", 2))
+        sector_counts = _sector_counts(active)
         top_n = int(cfg.get("paper_top_n", 5))
         max_open = int(cfg.get("paper_max_open", top_n))
         if len(active) >= max_open:
@@ -494,6 +556,16 @@ def paper_trading():
             continue
         if v["call"] != "enter":
             continue  # wait/avoid — не входим, статистика enter отдельно
+        # Концентрация: не больше max_per_sector бумаг из одной группы
+        sec = _sector_of(t)
+        if sector_counts.get(sec, 0) >= max_sector:
+            continue
+        # Ликвидность: тонкие бумаги входят/выходят по ценам, которых не было
+        min_turn = float(cfg.get("min_turnover_rub", 0) or 0)
+        if min_turn:
+            turn = intraday.avg_daily_turnover(t)
+            if turn is not None and turn < min_turn:
+                continue
         try:
             cd = store.get_meta(f"paper_cooldown_{t}", "")
             if cd:
@@ -507,8 +579,10 @@ def paper_trading():
         try:
             store.open_position(t, float(v["entry"]), float(v["stop"]),
                                 float(v["target"]), mode="paper",
-                                idx_entry=float(idx_val) if idx_val else None)
+                                idx_entry=float(idx_val) if idx_val else None,
+                                atr=float(v.get("atr") or 0) or None)
             entered += 1
+            sector_counts[sec] = sector_counts.get(sec, 0) + 1
             db.set_meta(_paper_entries_key(), str(paper_entries_today() + 1))
             if CONFIG["schedule"].get("send_paper_events", True):
                 deliver.send_text(
@@ -643,8 +717,11 @@ CYCLE_STATE = {"n": 0, "last": "", "err": ""}
 
 
 def cycle_status() -> str:
+    # build — метка сборки из конфига: по ней видно, что задеплоилась именно
+    # новая версия (логи Render недоступны, health — единственный канал).
     return (f"cycles={CYCLE_STATE['n']} last_cycle={CYCLE_STATE['last'] or '-'} "
-            f"cycle_err={CYCLE_STATE['err'][:60] or '-'}")
+            f"cycle_err={CYCLE_STATE['err'][:60] or '-'} "
+            f"build={CONFIG.get('build_id', '?')}")
 
 
 def start_health_server(port: int):

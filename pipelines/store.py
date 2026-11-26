@@ -62,7 +62,9 @@ CREATE TABLE IF NOT EXISTS positions (
     target NUMERIC,
     mode TEXT NOT NULL DEFAULT 'real',
     status TEXT NOT NULL DEFAULT 'open',
-    idx_entry NUMERIC
+    idx_entry NUMERIC,
+    peak NUMERIC,
+    atr NUMERIC
 );
 CREATE TABLE IF NOT EXISTS signals_log (
     id SERIAL PRIMARY KEY,
@@ -104,7 +106,9 @@ CREATE TABLE IF NOT EXISTS positions (
     target REAL,
     mode TEXT NOT NULL DEFAULT 'real',
     status TEXT NOT NULL DEFAULT 'open',
-    idx_entry REAL
+    idx_entry REAL,
+    peak REAL,
+    atr REAL
 );
 CREATE TABLE IF NOT EXISTS signals_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -133,7 +137,7 @@ def _now() -> str:
 def _fee_pct(fee_pct: float | None = None) -> float:
     if fee_pct is not None:
         return float(fee_pct)
-    return float((CONFIG.get("intraday") or {}).get("fee_pct", 1.0))
+    return float((CONFIG.get("intraday") or {}).get("fee_pct", 0.15))
 
 
 def _pg_dsn() -> str:
@@ -158,7 +162,9 @@ def _connect_pg():
                  "ALTER TABLE positions ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'real'",
                  "ALTER TABLE trades ADD COLUMN IF NOT EXISTS idx_entry NUMERIC",
                  "ALTER TABLE trades ADD COLUMN IF NOT EXISTS idx_exit NUMERIC",
-                 "ALTER TABLE positions ADD COLUMN IF NOT EXISTS idx_entry NUMERIC"):
+                 "ALTER TABLE positions ADD COLUMN IF NOT EXISTS idx_entry NUMERIC",
+                 "ALTER TABLE positions ADD COLUMN IF NOT EXISTS peak NUMERIC",
+                 "ALTER TABLE positions ADD COLUMN IF NOT EXISTS atr NUMERIC"):
         cur.execute(stmt)
     cur.close()
     return c
@@ -175,7 +181,9 @@ def _connect_sqlite():
                           ("mode", "positions", "TEXT NOT NULL DEFAULT 'real'"),
                           ("idx_entry", "trades", "REAL"),
                           ("idx_exit", "trades", "REAL"),
-                          ("idx_entry", "positions", "REAL")):
+                          ("idx_entry", "positions", "REAL"),
+                          ("peak", "positions", "REAL"),
+                          ("atr", "positions", "REAL")):
         try:
             cur.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
@@ -458,14 +466,35 @@ def trade_stats(days: int = 30, mode: str | None = None) -> dict:
 # ----------------------- positions -----------------------
 
 def open_position(ticker: str, entry_price: float, stop: float, target: float,
-                  mode: str = "real", idx_entry: float | None = None) -> int:
-    params = (ticker, entry_price, stop, target, mode, idx_entry, _now())
+                  mode: str = "real", idx_entry: float | None = None,
+                  atr: float | None = None) -> int:
+    # peak стартует с цены входа (HIGH воды для трейлинг-стопа)
+    params = (ticker, entry_price, stop, target, mode, idx_entry, atr,
+              entry_price, _now())
     return _insert_id(
-        "INSERT INTO positions(ticker, entry_price, stop, target, mode, idx_entry, status, created_at) "
-        "VALUES(%s,%s,%s,%s,%s,%s,'open',%s)",
-        "INSERT INTO positions(ticker, entry_price, stop, target, mode, idx_entry, status, created_at) "
-        "VALUES(?,?,?,?,?,?, 'open',?)",
+        "INSERT INTO positions(ticker, entry_price, stop, target, mode, idx_entry, atr, peak, status, created_at) "
+        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'open',%s)",
+        "INSERT INTO positions(ticker, entry_price, stop, target, mode, idx_entry, atr, peak, status, created_at) "
+        "VALUES(?,?,?,?,?,?,?,?, 'open',?)",
         params)
+
+
+def update_position_trail(pos_id: int, stop: float | None = None,
+                          peak: float | None = None):
+    """Двинуть стоп/максимум позиции (безубыток, трейлинг)."""
+    if stop is None and peak is None:
+        return
+    init()
+    ph = "%s" if _is_pg() else "?"
+    sets, params = [], []
+    if stop is not None:
+        sets.append(f"stop={ph}")
+        params.append(stop)
+    if peak is not None:
+        sets.append(f"peak={ph}")
+        params.append(peak)
+    params.append(pos_id)
+    _exec(f"UPDATE positions SET {', '.join(sets)} WHERE id={ph}", tuple(params))
 
 
 def close_position(pos_id: int, reason: str = "manual"):

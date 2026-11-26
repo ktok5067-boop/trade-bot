@@ -21,6 +21,51 @@ def _cfg(key, default):
     return (CONFIG.get("intraday") or {}).get(key, default)
 
 
+# Веса компонентов скоринга. Вынесены в конфиг (intraday.score_weights), чтобы
+# калибровать их на истории, а не править код руками. Значения по умолчанию —
+# те, что были захардкожены до 2026-11-27.
+DEFAULT_WEIGHTS: dict[str, float] = {
+    "trend_up": 1.5, "trend_down": -1.5,
+    "rsi_d_overbought": -0.5, "rsi_d_oversold": 0.5,
+    "adx_flat": -0.5, "adx_trend": 0.5,
+    "supertrend_up": 0.5, "supertrend_down": -0.5,
+    "obv_bull": 0.5, "obv_bear": -0.5,
+    "div_daily_bull": 1.0, "div_daily_bear": -1.0,
+    "vwap_above": 0.5, "vwap_below": -0.5,
+    "rsi_oversold": 0.5, "rsi_overbought": -1.0, "rsi_neutral": 0.5,
+    "rng_top": -0.5, "rng_upper": 0.5,
+    "spring": 1.5, "delta_div": 1.0, "break_high": 1.0,
+    "volnode_up": 1.0, "volnode_down": -1.0, "false_break_up": -0.5,
+    "level_support": 0.5, "level_resistance": -0.5,
+    "bos_up": 1.0, "bos_down": -1.0,
+    "sweep_low": 0.5, "sweep_high": -0.5,
+    "va_break_up": 1.0, "va_break_down": -1.0,
+    "div_intraday_bull": 1.0, "div_intraday_bear": -1.0,
+    "profile_above": 0.5, "profile_below": -0.5,
+    "neg_event": -1.0,
+    "vol_high": 0.5, "vol_low": -0.5,
+    "idx_down": -1.0, "idx_up": 0.5,
+    "event_risk": -1.0, "fee_blocked": -2.0,
+}
+
+
+def _weights() -> dict[str, float]:
+    """Веса компонентов.
+
+    Если в конфиге задан score_weights — он считается ПОЛНЫМ набором:
+    отсутствующие компоненты получают вес 0 (так их и обнуляет калибровка).
+    Исключение — fee_blocked: это жёсткий фильтр издержек, он не отключается.
+    Если конфиг пуст — работают значения по умолчанию (историческое поведение).
+    """
+    custom = (CONFIG.get("intraday") or {}).get("score_weights") or {}
+    if not custom:
+        return dict(DEFAULT_WEIGHTS)
+    w = {k: 0.0 for k in DEFAULT_WEIGHTS}
+    w.update({k: float(v) for k, v in custom.items() if k in DEFAULT_WEIGHTS})
+    w["fee_blocked"] = float(custom.get("fee_blocked", DEFAULT_WEIGHTS["fee_blocked"]))
+    return w
+
+
 def fetch_bars(secid: str, interval: int | None = None, days: int | None = None) -> list[dict]:
     """10-минутные свечи (новые в конце).
 
@@ -771,6 +816,22 @@ def _event_risk(secid: str, news: list[dict] | None) -> str | None:
     return None
 
 
+def avg_daily_turnover(secid: str, days: int = 20) -> float | None:
+    """Средний дневной оборот бумаги, ₽ (volume × close по дневным свечам).
+
+    Денежного оборота в дневных свечах db нет, поэтому объём в штуках
+    переводим в рубли по закрытию — это тот же порядок величины, что
+    в фильтре бэктеста (там value из ISS).
+    """
+    try:
+        candles = db.get_candles(secid, limit=days)
+    except Exception:
+        return None
+    vals = [float(c.get("volume") or 0) * float(c.get("close") or 0) for c in candles]
+    vals = [v for v in vals if v > 0]
+    return sum(vals) / len(vals) if vals else None
+
+
 def verdict(secid: str, ind: dict, daily_ind: dict | None = None,
             idx: dict | None = None, news: list[dict] | None = None) -> dict:
     """Скоринговый вердикт по бумаге (лонг-фокус для спота).
@@ -790,95 +851,87 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None,
     score = 0.0
     reasons: list[str] = []
     confirmations: set[str] = set()  # независимые подтверждения для конфлюэнса
+    trace: dict[str, int] = {}       # сработавшие компоненты — для калибровки весов
+    w = _weights()
+
+    def add(key: str, reason: str | None = None):
+        """Сработал компонент `key`: прибавить его вес и записать в trace."""
+        nonlocal score
+        pts = float(w.get(key, DEFAULT_WEIGHTS.get(key, 0.0)))
+        score += pts
+        trace[key] = trace.get(key, 0) + 1
+        if reason:
+            reasons.append(f"{reason} ({pts:+g})")
 
     # 1. Дневной тренд (контекст 3-4 дня)
     if daily_ind:
         tr = daily_ind.get("trend")
         if tr == "восходящий":
-            score += 1.5
-            reasons.append("дневной тренд восходящий (+1.5)")
+            add("trend_up", "дневной тренд восходящий")
             confirmations.add("trend")
         elif tr == "нисходящий":
-            score -= 1.5
-            reasons.append("дневной тренд нисходящий (−1.5)")
+            add("trend_down", "дневной тренд нисходящий")
         else:
             reasons.append("дневной тренд боковой (0)")
         if daily_ind.get("rsi14") is not None:
             if daily_ind["rsi14"] > 70:
-                score -= 0.5
-                reasons.append("дневной RSI >70 — перегрев (−0.5)")
+                add("rsi_d_overbought", "дневной RSI >70 — перегрев")
             elif daily_ind["rsi14"] < 35:
-                score += 0.5
-                reasons.append("дневной RSI <35 — перепроданность (+0.5)")
+                add("rsi_d_oversold", "дневной RSI <35 — перепроданность")
                 confirmations.add("trend")
         # ADX: сила дневного тренда — фильтр «тренд vs флэт»
         adx = daily_ind.get("adx14")
         if adx is not None:
             if adx < 20:
-                score -= 0.5
-                reasons.append(f"ADX {adx} <20 — на дневке флэт, пробои рискованны (−0.5)")
+                add("adx_flat", f"ADX {adx} <20 — на дневке флэт, пробои рискованны")
             elif adx >= 25 and tr in ("восходящий", "умеренно-восходящий"):
-                score += 0.5
-                reasons.append(f"ADX {adx} ≥25 — дневной тренд реальный (+0.5)")
+                add("adx_trend", f"ADX {adx} ≥25 — дневной тренд реальный")
         # Supertrend (дневной)
         st_dir = daily_ind.get("supertrend_dir")
         if st_dir == 1:
-            score += 0.5
-            reasons.append("Supertrend бычий на дневке (+0.5)")
+            add("supertrend_up", "Supertrend бычий на дневке")
             confirmations.add("supertrend")
         elif st_dir == -1:
-            score -= 0.5
-            reasons.append("Supertrend медвежий на дневке (−0.5)")
+            add("supertrend_down", "Supertrend медвежий на дневке")
         # OBV-дивергенция (дневная)
         obv_div = daily_ind.get("obv_div")
         if obv_div == "bull":
-            score += 0.5
-            reasons.append("OBV-дивергенция: скрытая покупка на дневке (+0.5)")
+            add("obv_bull", "OBV-дивергенция: скрытая покупка на дневке")
             confirmations.add("obv")
         elif obv_div == "bear":
-            score -= 0.5
-            reasons.append("OBV-дивергенция: скрытая продажа на дневке (−0.5)")
+            add("obv_bear", "OBV-дивергенция: скрытая продажа на дневке")
         # Дневные дивергенции RSI/MACD по свингам
         for d in daily_ind.get("divergences") or []:
             if "BULL" in d["kind"]:
-                score += 1.0
-                reasons.append(f"{d['text']} (+1)")
+                add("div_daily_bull", d["text"])
                 confirmations.add("divergence")
             else:
-                score -= 1.0
-                reasons.append(f"{d['text']} (−1)")
+                add("div_daily_bear", d["text"])
 
     # 2. Позиция относительно VWAP
     if vwap:
         if last > vwap:
-            score += 0.5
-            reasons.append("цена выше VWAP (+0.5)")
+            add("vwap_above", "цена выше VWAP")
             confirmations.add("vwap")
         else:
-            score -= 0.5
-            reasons.append("цена ниже VWAP (−0.5)")
+            add("vwap_below", "цена ниже VWAP")
 
     # 3. Интрадей RSI
     if rsi is not None:
         if rsi <= 25:
-            score += 0.5
-            reasons.append(f"RSI(10м) {rsi} — перепродано, отскок возможен (+0.5)")
+            add("rsi_oversold", f"RSI(10м) {rsi} — перепродано, отскок возможен")
             confirmations.add("rsi")
         elif rsi >= 75:
-            score -= 1.0
-            reasons.append(f"RSI(10м) {rsi} — перегрев, догонять опасно (−1)")
+            add("rsi_overbought", f"RSI(10м) {rsi} — перегрев, догонять опасно")
         elif 40 <= rsi <= 60:
-            score += 0.5
-            reasons.append(f"RSI(10м) {rsi} — нейтральная зона, есть топливо (+0.5)")
+            add("rsi_neutral", f"RSI(10м) {rsi} — нейтральная зона, есть топливо")
 
     # 4. Положение в диапазоне дня
     if rng_pos is not None:
         if rng_pos >= 97:
-            score -= 0.5
-            reasons.append(f"цена у потолка дня ({rng_pos}%) (−0.5)")
+            add("rng_top", f"цена у потолка дня ({rng_pos}%)")
         elif 50 <= rng_pos < 90:
-            score += 0.5
-            reasons.append(f"цена в верхней половине дня ({rng_pos}%) (+0.5)")
+            add("rng_upper", f"цена в верхней половине дня ({rng_pos}%)")
 
     # 5. События смарт-мани (только направленные; беснаправленный объём — не плюс)
     events = detect_events(secid, ind)
@@ -886,114 +939,90 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None,
     for e in events:
         t = e["type"]
         if t == "SPRING":
-            score += 1.5
-            reasons.append("SPRING — смыв продавцов у лоу (+1.5)")
+            add("spring", "SPRING — смыв продавцов у лоу")
             confirmations.add("event")
         elif t == "DELTA_DIV_POS":
-            score += 1.0
-            reasons.append("возможная покупка (эвристика по закрытиям свечей) (+1)")
+            add("delta_div", "возможная покупка (эвристика по закрытиям свечей)")
             confirmations.add("event")
         elif t == "BREAK_HIGH":
-            score += 1.0
-            reasons.append("пробой максимума предыдущих баров дня (+1)")
+            add("break_high", "пробой максимума предыдущих баров дня")
             confirmations.add("event")
         elif t == "VOL_NODE":
             detail = e.get("detail")
             if detail == "up":
-                score += 1.0
-                reasons.append("пробой объёмного узла ВВЕРХ (+1)")
+                add("volnode_up", "пробой объёмного узла ВВЕРХ")
                 confirmations.add("event")
             elif detail == "down":
-                score -= 1.0
-                reasons.append("пробой объёмного узла ВНИЗ — против лонга (−1)")
+                add("volnode_down", "пробой объёмного узла ВНИЗ — против лонга")
             elif detail == "false_breakout_up":
-                score -= 0.5
-                reasons.append("ложный пробой POC вверх (−0.5)")
+                add("false_break_up", "ложный пробой POC вверх")
             else:
                 reasons.append("возврат в POC после пробоя вниз — направление неясно (0)")
         elif t == "LEVEL_TEST":
             if e.get("level_side") == "support":
-                score += 0.5
-                reasons.append("отскок от поддержки (+0.5)")
+                add("level_support", "отскок от поддержки")
                 confirmations.add("event")
             elif e.get("level_side") == "resistance":
-                score -= 0.5
-                reasons.append("отказ от сопротивления — против лонга (−0.5)")
+                add("level_resistance", "отказ от сопротивления — против лонга")
             else:
                 reasons.append("тест уровня — направление неясно (0)")
         elif t == "ABSORPTION":
             reasons.append("объём без движения — набор или раздача, не подтверждение (0)")
         elif t in ("BOS_UP", "CHOC_UP"):
-            score += 1.0
-            reasons.append(f"{'разворот' if t == 'CHOC_UP' else 'продолжение'} структуры вверх (+1)")
+            add("bos_up", f"{'разворот' if t == 'CHOC_UP' else 'продолжение'} структуры вверх")
             confirmations.add("structure")
         elif t in ("BOS_DOWN", "CHOC_DOWN"):
-            score -= 1.0
-            reasons.append(f"{'разворот' if t == 'CHOC_DOWN' else 'продолжение'} структуры вниз — против лонга (−1)")
+            add("bos_down", f"{'разворот' if t == 'CHOC_DOWN' else 'продолжение'} структуры вниз — против лонга")
         elif t == "SWEEP_LOW":
-            score += 0.5
-            reasons.append("свип ликвидности под лоями с возвратом (+0.5)")
+            add("sweep_low", "свип ликвидности под лоями с возвратом")
             confirmations.add("structure")
         elif t == "SWEEP_HIGH":
-            score -= 0.5
-            reasons.append("свип ликвидности над хаями с возвратом — против лонга (−0.5)")
+            add("sweep_high", "свип ликвидности над хаями с возвратом — против лонга")
         elif t == "VA_BREAK_UP":
-            score += 1.0
-            reasons.append("пробой VAH многодневного профиля вверх (+1)")
+            add("va_break_up", "пробой VAH многодневного профиля вверх")
             confirmations.add("profile")
         elif t == "VA_BREAK_DOWN":
-            score -= 1.0
-            reasons.append("пробой VAL многодневного профиля вниз — против лонга (−1)")
+            add("va_break_down", "пробой VAL многодневного профиля вниз — против лонга")
         elif t in ("RSI_BULL_DIV", "MACD_BULL_DIV"):
-            score += 1.0
-            reasons.append("бычья интрадей-дивергенция (+1)")
+            add("div_intraday_bull", "бычья интрадей-дивергенция")
             confirmations.add("divergence")
         elif t in ("RSI_BEAR_DIV", "MACD_BEAR_DIV"):
-            score -= 1.0
-            reasons.append("медвежья интрадей-дивергенция — против лонга (−1)")
+            add("div_intraday_bear", "медвежья интрадей-дивергенция — против лонга")
         elif t in neg_ev:
-            score -= 1.0
-            reasons.append(f"{RUS.get(t, t)} — против лонга (−1)")
+            add("neg_event", f"{RUS.get(t, t)} — против лонга")
 
     # 5b. Положение относительно зоны стоимости многодневного профиля
     profile = ind.get("profile")
     if profile:
         if last > profile["vah"]:
-            score += 0.5
-            reasons.append("цена выше VAH многодневного профиля — сильнее рынка (+0.5)")
+            add("profile_above", "цена выше VAH многодневного профиля — сильнее рынка")
             confirmations.add("profile")
         elif last < profile["val"]:
-            score -= 0.5
-            reasons.append("цена ниже VAL многодневного профиля — слабее рынка (−0.5)")
+            add("profile_below", "цена ниже VAL многодневного профиля — слабее рынка")
 
     # 6. Участие объёма
     vol = ind.get("vol_ratio")
     if vol is not None:
         if vol >= 1.5:
-            score += 0.5
-            reasons.append(f"объём x{vol} — участие крупных (+0.5)")
+            add("vol_high", f"объём x{vol} — участие крупных")
             confirmations.add("volume")
         elif vol <= 0.4:
-            score -= 0.5
-            reasons.append(f"объём x{vol} — рынок выдохся (−0.5)")
+            add("vol_low", f"объём x{vol} — рынок выдохся")
 
     # 7. Контекст индекса (IMOEX) — лонг против падающего рынка опасен
     idx_chg = None
     if idx and idx.get("chg_pct") is not None:
         idx_chg = float(idx["chg_pct"])
         if idx_chg <= -1.0:
-            score -= 1.0
-            reasons.append(f"IMOEX {idx_chg:+.2f}% — рынок падает, против тренда (−1)")
+            add("idx_down", f"IMOEX {idx_chg:+.2f}% — рынок падает, против тренда")
         elif idx_chg >= 1.0:
-            score += 0.5
-            reasons.append(f"IMOEX {idx_chg:+.2f}% — рынок растёт, попутный ветер (+0.5)")
+            add("idx_up", f"IMOEX {idx_chg:+.2f}% — рынок растёт, попутный ветер")
             confirmations.add("index")
 
     # 8. Риск события (event risk): новости-катализаторы в ближайшие дни
     event_risk = _event_risk(secid, news)
     if event_risk:
-        score -= 1.0
-        reasons.append(f"риск события: {event_risk} (−1)")
+        add("event_risk", f"риск события: {event_risk}")
 
     # Вход/стоп/цель. Горизонт владельца — свинг (неделя-две) или пересиживание,
     # поэтому стоп/цель считаем от ДНЕВНОГО ATR, а не от размаха текущего дня:
@@ -1024,17 +1053,25 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None,
         if level_stop < stop:  # ниже ATR-стопа — уровень держится лучше, берём его
             stop = level_stop
 
-    # --- учёт издержек (комиссия вход+выход, % от движения) ---
-    fee = float(_cfg("fee_pct", 1.0))
-    min_net = float(_cfg("min_net_pct", 1.5))
+    # --- учёт издержек: комиссия round-trip + проскальзывание на обе стороны ---
+    # Тариф владельца: 0.15% вход+выход. Раньше стояло 1.0% «на глаз» — при таком
+    # допущении резалась половина рабочих сетапов, а R/R считался неправильно.
+    fee = float(_cfg("fee_pct", 0.15))
+    slip = float(_cfg("slip_pct", 0.05))
+    cost = fee + 2 * slip
+    min_net = float(_cfg("min_net_pct", 1.0))
+    min_rr = float(_cfg("min_rr", 1.2))
     gross_pct = (target - entry) / entry * 100 if entry else 0
-    net_pct = gross_pct - fee  # чистая прибыль после комиссии
-    # если сетап не окупает комиссию — вход бессмыслен
-    fee_blocked = net_pct < min_net
+    risk_gross_pct = (entry - stop) / entry * 100 if entry else 0
+    net_pct = gross_pct - cost                 # чистая прибыль при достижении цели
+    net_loss_pct = risk_gross_pct + cost       # чистый убыток при срабатывании стопа
+    net_rr = net_pct / net_loss_pct if net_loss_pct > 0 else 0.0
+    # Сетап отклоняется, если не окупает издержки ИЛИ не даёт чистого R/R после них.
+    fee_blocked = net_pct < min_net or net_rr < min_rr
     if fee_blocked:
-        score -= 2.0
-        reasons.append(f"издержки {fee}% съедают потенциал: чистая ≈ {net_pct:.1f}% "
-                       f"(нужно ≥ {min_net:.1f}%) (−2)")
+        add("fee_blocked",
+            f"после издержек: цель {net_pct:.1f}%, риск {net_loss_pct:.1f}%, "
+            f"R/R {net_rr:.2f} (нужно ≥{min_net:.1f}% и R/R ≥{min_rr})")
 
     # ближайший уровень поддержки — доп. ориентир (не сам стоп)
     sup_ref = levels.get("nearest_support")
@@ -1044,14 +1081,17 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None,
     # конфлюэнс: вход только при >= 2 независимых подтверждений (иначе слабый сигнал)
     n_conf = len(confirmations)
     need_conf = int(_cfg("min_confirmations", 2))
+    enter_score = float(_cfg("enter_score", 2.0))
+    wait_score = float(_cfg("wait_score", 0.5))
+    confluence_cap = float(_cfg("confluence_cap", 1.5))
     weak_confluence = n_conf < need_conf
-    if weak_confluence and score >= 2.0:
-        score = min(score, 1.5)  # не дотягивает до "enter" без конфлюэнса
+    if weak_confluence and score >= enter_score:
+        score = min(score, confluence_cap)  # не дотягивает до "enter" без конфлюэнса
         reasons.append(f"мало независимых подтверждений ({n_conf}<{need_conf}) — ослабляю")
 
-    if score >= 2.0 and not fee_blocked:
+    if score >= enter_score and not fee_blocked:
         call = "enter"
-    elif score >= 0.5:
+    elif score >= wait_score:
         call = "wait"
     else:
         call = "avoid"
@@ -1061,9 +1101,12 @@ def verdict(secid: str, ind: dict, daily_ind: dict | None = None,
         "entry": entry, "stop": stop, "target": target,
         "risk_pct": risk_pct, "reasons": reasons,
         "sup_ref": sup_ref, "res_ref": res_ref, "atr": atr,
-        "fee_pct": fee, "gross_pct": round(gross_pct, 2),
-        "net_pct": round(net_pct, 2),
+        "fee_pct": fee, "slip_pct": slip, "cost_pct": round(cost, 2),
+        "gross_pct": round(gross_pct, 2),
+        "net_pct": round(net_pct, 2), "net_loss_pct": round(net_loss_pct, 2),
+        "net_rr": round(net_rr, 2),
         "confirmations": sorted(confirmations),
+        "trace": trace,          # сработавшие компоненты: для калибровки весов
         "idx_chg": idx_chg,
         "vol_ratio": ind.get("vol_ratio"),
         "pulse_ratio": ind.get("pulse_ratio"),
@@ -1106,10 +1149,12 @@ def _verdict_line(v: dict) -> str:
         parts.append(f"Горизонт: {hname}")
     if v.get("invalidate"):
         parts.append(f"Идея отменяется ниже {v['invalidate']:.4g} ₽")
-    # издержки и чистая прибыль
+    # издержки, чистая прибыль и чистое R/R
     if v.get("net_pct") is not None:
-        parts.append(f"Движение: {v.get('gross_pct', 0)}% − комиссия {v.get('fee_pct', 0)}% "
-                     f"= чистая ≈ {v['net_pct']}%")
+        cost = v.get("cost_pct", v.get("fee_pct", 0))
+        parts.append(f"Цель {v.get('gross_pct', 0)}% − издержки {cost}% "
+                     f"= чистая ≈ {v['net_pct']}% · риск {v.get('net_loss_pct', 0)}% "
+                     f"· R/R {v.get('net_rr', 0)}")
     parts.append("Почему: " + "; ".join(v["reasons"]) if v["reasons"] else "аргументов мало")
     return "\n".join(parts)
 
